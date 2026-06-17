@@ -465,6 +465,12 @@ http://127.0.0.1:5173
 
 ### Linux 后台运行
 
+服务默认端口是 `5173`。Linux 部署时可以用 `PORT` 指定高位端口，例如 `20020`：
+
+```bash
+PORT=20020 npm run server
+```
+
 从 GitHub 拉取部署：
 
 ```bash
@@ -473,7 +479,7 @@ git clone git@github.com:daimon3332/model-detect.git
 cd /root/model-detect
 npm install
 npm run build
-npm run server
+PORT=20020 npm run server
 ```
 
 如果已经 clone 过：
@@ -483,14 +489,14 @@ cd /root/model-detect
 git pull
 npm install
 npm run build
-npm run server
+PORT=20020 npm run server
 ```
 
 后台运行：
 
 ```bash
 cd /root/model-detect
-nohup npm run server > server.log 2>&1 & echo $! > server.pid
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
 
 停止：
@@ -499,22 +505,28 @@ nohup npm run server > server.log 2>&1 & echo $! > server.pid
 kill $(cat server.pid)
 ```
 
+如果忘了保存 pid，也可以按端口终止：
+
+```bash
+fuser -k 20020/tcp
+```
+
 查看端口：
 
 ```bash
-ss -ltnp | grep ':5173'
+ss -ltnp | grep ':20020'
 ```
 
 开放端口：
 
 ```bash
-ufw allow 5173/tcp
+ufw allow 20020/tcp
 ```
 
 访问：
 
 ```text
-http://服务器IP:5173
+http://服务器IP:20020
 ```
 
 更新并重启：
@@ -525,7 +537,7 @@ git pull
 npm install
 npm run build
 kill $(cat server.pid)
-nohup npm run server > server.log 2>&1 & echo $! > server.pid
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
 
 生产环境建议后续改为 systemd 或 Nginx/Caddy 托管前端静态文件；当前阶段可以直接用 `npm run server` 同时提供 API 和前端页面。
