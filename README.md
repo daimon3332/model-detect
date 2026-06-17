@@ -4,6 +4,159 @@ Model Detect 是一个面向 Codex CLI / Claude Code CLI 的模型提供商监�
 
 它不是普通的“直接请求模型 API”的检测工具，而是通过真实 CLI 发起检测，并通过本地代理记录 CLI 发出的原始 HTTP 请求和上游响应。
 
+## 前置条件
+
+必须安装：
+
+| 依赖 | 用途 | 验证命令 |
+| --- | --- | --- |
+| Node.js / npm | 安装依赖、构建前端、运行后端服务 | `node -v` / `npm -v` |
+| Codex CLI | 检测 Codex 模型 | `codex --version` |
+| Claude Code CLI | 检测 Claude Code 模型 | `claude --version` |
+
+Node.js 建议使用 `^20.19.0` 或 `>=22.12.0`，因为当前项目使用 Vite 7。
+
+真实检测还需要准备：
+
+| 项目 | 是否必须 | 说明 |
+| --- | --- | --- |
+| 模型提供商 Base URL | 是 | 例如 OpenAI-compatible `/v1` 或 Anthropic-compatible 地址 |
+| API Key | 是 | 在“模型提供商”页面配置 |
+| Git | 部署推荐 | 用于 `git clone` / `git pull` 更新项目 |
+| ufw | 可选 | Linux 开放端口时使用 |
+| Nginx / Caddy | 可选 | 需要域名、HTTPS、反代时使用 |
+
+不需要提前配置用户级 Codex / Claude Code。项目会为每个模型提供商创建独立目录：
+
+```text
+data/providers/<provider-id>/codex-home/config.toml
+data/providers/<provider-id>/claude-workspace/.claude/settings.json
+```
+
+## 启动方式
+
+### 本地完整启动
+
+```bash
+npm install
+npm run build
+npm run server
+```
+
+默认访问：
+
+```text
+http://127.0.0.1:5173
+```
+
+默认管理员密码：
+
+```text
+admin
+```
+
+### 本地前端开发
+
+```bash
+npm install
+npm run dev
+```
+
+仅启动前端开发服务。后端不可用时，前端会回退到 localStorage mock，不能真实调用 CLI。
+
+### 指定端口启动
+
+服务默认端口是 `5173`，可以用 `PORT` 指定高位端口：
+
+```bash
+PORT=20020 npm run server
+```
+
+Windows PowerShell：
+
+```powershell
+$env:PORT="20020"; npm run server
+```
+
+## Linux 部署和后台运行
+
+### 首次部署
+
+```bash
+cd /root
+git clone https://github.com/daimon3332/model-detect.git
+cd /root/model-detect
+npm install
+npm run build
+ufw allow 20020/tcp
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+如果服务器已配置 GitHub SSH key，也可以使用：
+
+```bash
+git clone git@github.com:daimon3332/model-detect.git
+```
+
+访问：
+
+```text
+http://服务器IP:20020
+```
+
+首次登录后建议立刻到“全局设置”修改默认管理员密码。
+
+### 已有仓库更新部署
+
+当前推荐用 git 直接更新：
+
+```bash
+cd /root/model-detect
+git pull
+npm install
+npm run build
+fuser -k 20020/tcp || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+`data/` 是本地运行数据目录，已加入 `.gitignore`，`git pull` 不会覆盖 provider 配置、管理员密码和检测日志。
+
+### 停止后台服务
+
+优先使用 pid 文件：
+
+```bash
+cd /root/model-detect
+kill $(cat server.pid)
+```
+
+如果 pid 文件不存在，按端口终止：
+
+```bash
+fuser -k 20020/tcp
+```
+
+### 查看运行状态
+
+```bash
+ss -ltnp | grep ':20020'
+```
+
+```bash
+cd /root/model-detect
+tail -f server.log
+```
+
+### Nginx / Cloudflare
+
+可以使用 Nginx 反代到本地服务：
+
+```text
+Nginx / Cloudflare -> 127.0.0.1:20020
+```
+
+如果开启 Cloudflare 小黄云，必须给 `/api/*` 配置 bypass cache，避免接口、登录状态、日志和检测结果被缓存。
+
 ## 核心目标
 
 1. 管理多个模型提供商。
@@ -437,176 +590,6 @@ Proxy: socks5://127.0.0.1:7890
 `exchanges` 保存一次 CLI 执行中捕获到的所有 HTTP 交换。
 
 首页状态码默认使用主要模型请求的 `statusCode`。
-
-## 启动方式
-
-### 开发前端
-
-```bash
-npm install
-npm run dev
-```
-
-仅启动前端开发服务。后端不可用时，前端回退 localStorage mock。
-
-### 完整启动
-
-```bash
-npm install
-npm run build
-npm run server
-```
-
-访问：
-
-```text
-http://127.0.0.1:5173
-```
-
-### Linux 后台运行
-
-服务默认端口是 `5173`。Linux 部署建议指定高位端口，例如当前约定使用 `20020`：
-
-```bash
-PORT=20020 npm run server
-```
-
-启动后访问：
-
-```text
-http://服务器IP:20020
-```
-
-默认只需要输入管理员密码：
-
-```text
-admin
-```
-
-首次进入后建议立刻到“全局设置”修改管理员密码。
-
-### Linux 首次部署
-
-如果服务器还没有项目目录：
-
-```bash
-cd /root
-git clone https://github.com/daimon3332/model-detect.git
-cd /root/model-detect
-npm install
-npm run build
-ufw allow 20020/tcp
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-```
-
-如果使用 SSH remote，也可以改成：
-
-```bash
-git clone git@github.com:daimon3332/model-detect.git
-```
-
-前提是服务器已经配置好 GitHub SSH key。
-
-### Linux 已有仓库更新部署
-
-当前服务器 `/root/model-detect` 已按 git 仓库方式部署，后续更新直接拉取即可：
-
-```bash
-cd /root/model-detect
-git pull
-npm install
-npm run build
-fuser -k 20020/tcp || true
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-```
-
-如果当前进程是用 `server.pid` 启动并且 pid 文件还在，也可以用下面方式重启：
-
-```bash
-cd /root/model-detect
-kill $(cat server.pid) 2>/dev/null || true
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-```
-
-### Linux 停止服务
-
-优先使用 pid 文件停止：
-
-```bash
-cd /root/model-detect
-kill $(cat server.pid)
-```
-
-如果 pid 文件不存在、进程已变更，按端口终止：
-
-```bash
-fuser -k 20020/tcp
-```
-
-### Linux 查看运行状态
-
-查看端口监听：
-
-```bash
-ss -ltnp | grep ':20020'
-```
-
-查看后台日志：
-
-```bash
-cd /root/model-detect
-tail -f server.log
-```
-
-查看最近 100 行日志：
-
-```bash
-cd /root/model-detect
-tail -n 100 server.log
-```
-
-### Linux 端口说明
-
-开放 `20020`：
-
-```bash
-ufw allow 20020/tcp
-```
-
-确认规则：
-
-```bash
-ufw status
-```
-
-浏览器访问：
-
-```text
-http://服务器IP:20020
-```
-
-例如当前测试环境使用：
-
-```text
-http://134.185.110.164:20020
-```
-
-### Linux 一键更新命令
-
-如果只是从 GitHub 拉取最新版并重启：
-
-```bash
-cd /root/model-detect
-git pull
-npm install
-npm run build
-fuser -k 20020/tcp || true
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-```
-
-注意：`data/` 是本地运行数据目录，已加入 `.gitignore`，`git pull` 不会覆盖 provider 配置、管理员密码和检测日志。
-
-生产环境建议后续改为 systemd 或 Nginx/Caddy 托管前端静态文件；当前阶段可以直接用 `npm run server` 同时提供 API 和前端页面。
 
 ## 验证命令
 
