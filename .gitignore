@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.*
+data/
+data-test/
+*.log
+*.pid
+coverage/
+.deploy/
+_refs/
+.DS_Store
+Thumbs.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
