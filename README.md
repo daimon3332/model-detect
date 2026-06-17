@@ -465,80 +465,146 @@ http://127.0.0.1:5173
 
 ### Linux 后台运行
 
-服务默认端口是 `5173`。Linux 部署时可以用 `PORT` 指定高位端口，例如 `20020`：
+服务默认端口是 `5173`。Linux 部署建议指定高位端口，例如当前约定使用 `20020`：
 
 ```bash
 PORT=20020 npm run server
 ```
 
-从 GitHub 拉取部署：
-
-```bash
-cd /root
-git clone git@github.com:daimon3332/model-detect.git
-cd /root/model-detect
-npm install
-npm run build
-PORT=20020 npm run server
-```
-
-如果已经 clone 过：
-
-```bash
-cd /root/model-detect
-git pull
-npm install
-npm run build
-PORT=20020 npm run server
-```
-
-后台运行：
-
-```bash
-cd /root/model-detect
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-```
-
-停止：
-
-```bash
-kill $(cat server.pid)
-```
-
-如果忘了保存 pid，也可以按端口终止：
-
-```bash
-fuser -k 20020/tcp
-```
-
-查看端口：
-
-```bash
-ss -ltnp | grep ':20020'
-```
-
-开放端口：
-
-```bash
-ufw allow 20020/tcp
-```
-
-访问：
+启动后访问：
 
 ```text
 http://服务器IP:20020
 ```
 
-更新并重启：
+默认只需要输入管理员密码：
+
+```text
+admin
+```
+
+首次进入后建议立刻到“全局设置”修改管理员密码。
+
+### Linux 首次部署
+
+如果服务器还没有项目目录：
+
+```bash
+cd /root
+git clone https://github.com/daimon3332/model-detect.git
+cd /root/model-detect
+npm install
+npm run build
+ufw allow 20020/tcp
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+如果使用 SSH remote，也可以改成：
+
+```bash
+git clone git@github.com:daimon3332/model-detect.git
+```
+
+前提是服务器已经配置好 GitHub SSH key。
+
+### Linux 已有仓库更新部署
+
+当前服务器 `/root/model-detect` 已按 git 仓库方式部署，后续更新直接拉取即可：
 
 ```bash
 cd /root/model-detect
 git pull
 npm install
 npm run build
-kill $(cat server.pid)
+fuser -k 20020/tcp || true
 PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
+
+如果当前进程是用 `server.pid` 启动并且 pid 文件还在，也可以用下面方式重启：
+
+```bash
+cd /root/model-detect
+kill $(cat server.pid) 2>/dev/null || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+### Linux 停止服务
+
+优先使用 pid 文件停止：
+
+```bash
+cd /root/model-detect
+kill $(cat server.pid)
+```
+
+如果 pid 文件不存在、进程已变更，按端口终止：
+
+```bash
+fuser -k 20020/tcp
+```
+
+### Linux 查看运行状态
+
+查看端口监听：
+
+```bash
+ss -ltnp | grep ':20020'
+```
+
+查看后台日志：
+
+```bash
+cd /root/model-detect
+tail -f server.log
+```
+
+查看最近 100 行日志：
+
+```bash
+cd /root/model-detect
+tail -n 100 server.log
+```
+
+### Linux 端口说明
+
+开放 `20020`：
+
+```bash
+ufw allow 20020/tcp
+```
+
+确认规则：
+
+```bash
+ufw status
+```
+
+浏览器访问：
+
+```text
+http://服务器IP:20020
+```
+
+例如当前测试环境使用：
+
+```text
+http://134.185.110.164:20020
+```
+
+### Linux 一键更新命令
+
+如果只是从 GitHub 拉取最新版并重启：
+
+```bash
+cd /root/model-detect
+git pull
+npm install
+npm run build
+fuser -k 20020/tcp || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+注意：`data/` 是本地运行数据目录，已加入 `.gitignore`，`git pull` 不会覆盖 provider 配置、管理员密码和检测日志。
 
 生产环境建议后续改为 systemd 或 Nginx/Caddy 托管前端静态文件；当前阶段可以直接用 `npm run server` 同时提供 API 和前端页面。
 
