@@ -26,6 +26,39 @@ button {
   min-height: 100vh;
 }
 
+.auth-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.12);
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+  color: #10233f;
+  font-size: 20px;
+}
+
+.auth-card p {
+  margin: 0;
+  color: #64748b;
+}
+
+.auth-submit {
+  width: 100%;
+}
+
 .topbar {
   display: grid;
   grid-template-columns: 210px 1fr auto;

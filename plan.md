@@ -1106,3 +1106,131 @@ Linux 验证：
 
 默认不触发真实模型检测。
 
+## 18. 本轮确认实施计划：管理员密码入口
+
+用户确认增加一个简单管理员入口。
+
+### 18.1 目标
+
+进入页面前必须输入管理员密码，否则不能看到模型监控、模型提供商、日志、请求详情和全局设置。
+
+规则：
+
+```text
+不需要账号
+只需要密码
+默认密码：admin
+全局设置可以修改密码
+```
+
+### 18.2 后端鉴权
+
+新增设置字段：
+
+```ts
+settings.adminPassword
+```
+
+默认值：
+
+```text
+admin
+```
+
+新增 API：
+
+```text
+POST /api/login
+POST /api/logout
+GET /api/session
+```
+
+登录成功后，后端设置 HttpOnly Cookie：
+
+```text
+model_detect_session=<token>; HttpOnly; Path=/; SameSite=Lax
+```
+
+session token 保存在后端内存中，服务重启后需要重新登录。
+
+### 18.3 API 保护
+
+除以下接口外，所有 `/api/*` 都需要登录：
+
+```text
+POST /api/login
+POST /api/logout
+GET /api/session
+```
+
+受保护接口包括：
+
+```text
+GET /api/state
+GET /api/logs
+POST /api/providers
+DELETE /api/providers/:id
+POST /api/settings
+POST /api/checks
+```
+
+未登录时返回：
+
+```http
+401 Unauthorized
+```
+
+### 18.4 前端登录页
+
+App 启动后先调用：
+
+```text
+GET /api/session
+```
+
+未登录时只显示登录页：
+
+```text
+Model Detect
+管理员密码
+进入
+```
+
+登录成功后再加载主应用状态。
+
+### 18.5 全局设置修改密码
+
+全局设置增加：
+
+```text
+新管理员密码
+确认管理员密码
+```
+
+保存规则：
+
+- 留空表示不修改密码。
+- 两次输入必须一致。
+- 新密码不能为空字符串。
+- 保存后写入 `settings.adminPassword`。
+
+### 18.6 验证
+
+本地验证：
+
+```bash
+npm run typecheck
+node --check server/index.mjs
+npm run build
+```
+
+功能验证：
+
+- 打开页面先显示登录页。
+- 错误密码不能进入。
+- 默认密码 `admin` 可以进入。
+- 未登录请求 `/api/state` 返回 401。
+- 登录后 `/api/state` 正常。
+- 全局设置可以修改密码。
+- 清 cookie 后新密码生效。
+

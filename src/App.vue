@@ -37,7 +37,7 @@ import {
   modelsToText,
   recentRuns,
 } from './mockApi'
-import { deleteProviderApi, loadInitialState, refreshState, runChecksApi, saveProviderApi, saveSettingsApi } from './api'
+import { checkSessionApi, deleteProviderApi, loadInitialState, loginApi, logoutApi, refreshState, runChecksApi, saveProviderApi, saveSettingsApi } from './api'
 import type { AgentType, AppState, ProviderConfig, RunState, TestRun } from './types'
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
@@ -110,6 +110,12 @@ const activeDetailTab = ref<DetailTab>('request_headers')
 const codexModelText = ref('')
 const claudeModelText = ref('')
 const selectedProviderId = ref('')
+const checkingAuth = ref(true)
+const authenticated = ref(false)
+const loginPassword = ref('')
+const loginLoading = ref(false)
+const newAdminPassword = ref('')
+const confirmAdminPassword = ref('')
 
 const filters = reactive({
   providerId: 'all',
@@ -257,7 +263,21 @@ const detailMeta = (value: unknown) => {
 }
 
 const saveSettings = async () => {
-  await saveSettingsApi(state)
+  const extra: Record<string, string> = {}
+  if (newAdminPassword.value || confirmAdminPassword.value) {
+    if (!newAdminPassword.value.trim()) {
+      ElMessage.error('管理员密码不能为空')
+      return
+    }
+    if (newAdminPassword.value !== confirmAdminPassword.value) {
+      ElMessage.error('两次输入的管理员密码不一致')
+      return
+    }
+    extra.adminPassword = newAdminPassword.value
+  }
+  await saveSettingsApi(state, extra)
+  newAdminPassword.value = ''
+  confirmAdminPassword.value = ''
   ElMessage.success('已保存')
 }
 
@@ -270,6 +290,37 @@ const navToProviders = () => {
   openCreateProvider()
 }
 
+const login = async () => {
+  if (!loginPassword.value) {
+    ElMessage.error('请输入管理员密码')
+    return
+  }
+  loginLoading.value = true
+  try {
+    await loginApi(loginPassword.value)
+    authenticated.value = true
+    loginPassword.value = ''
+    await refreshState(state)
+  } catch {
+    ElMessage.error('密码错误')
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+const logout = async () => {
+  await logoutApi().catch(() => undefined)
+  authenticated.value = false
+  loginPassword.value = ''
+}
+
+const boot = async () => {
+  checkingAuth.value = true
+  authenticated.value = await checkSessionApi()
+  checkingAuth.value = false
+  if (authenticated.value) await refreshState(state).catch(() => undefined)
+}
+
 watch(
   () => [filters.providerId, filters.agent],
   () => {
@@ -277,13 +328,43 @@ watch(
   }
 )
 
-onMounted(() => {
-  refreshState(state).catch(() => undefined)
-})
+onMounted(boot)
 </script>
 
 <template>
-  <div class="app-shell">
+  <div v-if="checkingAuth" class="auth-shell">
+    <el-card shadow="never" class="auth-card">
+      <div class="auth-brand">
+        <span class="brand-mark">M</span>
+        <strong>Model Detect</strong>
+      </div>
+      <p>正在检查管理员会话...</p>
+    </el-card>
+  </div>
+
+  <div v-else-if="!authenticated" class="auth-shell">
+    <el-card shadow="never" class="auth-card">
+      <div class="auth-brand">
+        <span class="brand-mark">M</span>
+        <strong>Model Detect</strong>
+      </div>
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item label="管理员密码">
+          <el-input
+            v-model="loginPassword"
+            type="password"
+            show-password
+            autofocus
+            placeholder="默认密码：admin"
+            @keyup.enter="login"
+          />
+        </el-form-item>
+        <el-button type="primary" :loading="loginLoading" class="auth-submit" @click="login">进入</el-button>
+      </el-form>
+    </el-card>
+  </div>
+
+  <div v-else class="app-shell">
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">M</span>
@@ -303,6 +384,7 @@ onMounted(() => {
       </nav>
       <div class="top-actions">
         <el-button :icon="CirclePlus" type="primary" @click="openCreateProvider">添加提供商</el-button>
+        <el-button @click="logout">退出</el-button>
       </div>
     </header>
 
@@ -543,6 +625,12 @@ onMounted(() => {
             </el-form-item>
             <el-form-item label="日志脱敏">
               <el-switch v-model="state.settings.redactLogs" />
+            </el-form-item>
+            <el-form-item label="新管理员密码">
+              <el-input v-model="newAdminPassword" type="password" show-password placeholder="留空表示不修改" />
+            </el-form-item>
+            <el-form-item label="确认管理员密码">
+              <el-input v-model="confirmAdminPassword" type="password" show-password placeholder="再次输入新密码" />
             </el-form-item>
           </el-form>
         </el-card>

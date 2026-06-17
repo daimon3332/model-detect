@@ -5,6 +5,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { ProxyAgent } from 'proxy-agent'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -17,6 +18,7 @@ const maxCapturedBodyChars = 2_000_000
 let proxyServer = null
 let proxyServerPort = null
 let activeProxyContext = null
+const sessions = new Set()
 
 const defaults = {
   providers: [],
@@ -32,7 +34,8 @@ const defaults = {
     scheduleMinutes: 30,
     proxyPort: 7788,
     logRetentionDays: 30,
-    redactLogs: true
+    redactLogs: true,
+    adminPassword: 'admin'
   }
 }
 
@@ -80,6 +83,7 @@ function normalizeSettings(settings = {}) {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
 }
 
@@ -103,13 +107,39 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-function send(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers })
   res.end(JSON.stringify(body))
 }
 
+function publicState(state) {
+  const { adminPassword, ...settings } = state.settings
+  return { ...state, settings }
+}
+
+function parseCookies(req) {
+  return Object.fromEntries(
+    String(req.headers.cookie || '')
+      .split(';')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((item) => {
+        const index = item.indexOf('=')
+        return index === -1 ? [item, ''] : [item.slice(0, index), decodeURIComponent(item.slice(index + 1))]
+      })
+  )
+}
+
+function sessionToken(req) {
+  return parseCookies(req).model_detect_session || ''
+}
+
+function isAuthenticated(req) {
+  return sessions.has(sessionToken(req))
+}
+
 function safeId(value) {
-  return String(value || crypto.randomUUID()).replace(/[^a-zA-Z0-9_-]/g, '-')
+  return String(value || randomUUID()).replace(/[^a-zA-Z0-9_-]/g, '-')
 }
 
 function providerBase(provider) {
@@ -578,25 +608,53 @@ async function serveStatic(req, res) {
 }
 
 async function handleApi(req, res, pathname) {
-  if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, await loadState())
+  if (req.method === 'GET' && pathname === '/api/session') {
+    return send(res, 200, { authenticated: isAuthenticated(req) })
+  }
+  if (req.method === 'POST' && pathname === '/api/login') {
+    const body = await readJson(req)
+    const state = await loadState()
+    if (String(body.password || '') !== state.settings.adminPassword) {
+      return send(res, 401, { error: 'invalid_password' })
+    }
+    const token = randomUUID()
+    sessions.add(token)
+    return send(res, 200, { ok: true }, {
+      'set-cookie': `model_detect_session=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Lax`
+    })
+  }
+  if (req.method === 'POST' && pathname === '/api/logout') {
+    const token = sessionToken(req)
+    if (token) sessions.delete(token)
+    return send(res, 200, { ok: true }, {
+      'set-cookie': 'model_detect_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0'
+    })
+  }
+
+  if (!isAuthenticated(req)) return send(res, 401, { error: 'unauthorized' })
+
+  if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs)
-  if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, await upsertProvider(await readJson(req)))
+  if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req))))
   if (req.method === 'POST' && pathname === '/api/settings') {
     const state = await loadState()
-    state.settings = normalizeSettings({ ...state.settings, ...(await readJson(req)) })
+    const body = await readJson(req)
+    if (body.adminPassword === '') delete body.adminPassword
+    state.settings = normalizeSettings({ ...state.settings, ...body })
     await saveState(state)
-    return send(res, 200, state)
+    return send(res, 200, publicState(state))
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)
-    return send(res, 200, await runChecks({
+    const result = await runChecks({
       providerId: body.providerId,
       agent: body.agent,
       modelName: body.modelName
-    }))
+    })
+    return send(res, 200, { ...result, state: publicState(result.state) })
   }
   const deleteMatch = pathname.match(/^\/api\/providers\/([^/]+)$/)
-  if (req.method === 'DELETE' && deleteMatch) return send(res, 200, await deleteProvider(deleteMatch[1]))
+  if (req.method === 'DELETE' && deleteMatch) return send(res, 200, publicState(await deleteProvider(deleteMatch[1])))
   send(res, 404, { error: 'not_found' })
 }
 

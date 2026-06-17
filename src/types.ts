@@ -44,6 +44,7 @@ export interface GlobalSettings {
   proxyPort: number
   logRetentionDays: number
   redactLogs: boolean
+  adminPassword?: string
 }
 
 export interface CheckTarget {

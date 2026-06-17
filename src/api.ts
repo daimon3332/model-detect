@@ -1,4 +1,4 @@
-import type { AppState, CheckTarget, ProviderConfig } from './types'
+import type { AppState, CheckTarget, GlobalSettings, ProviderConfig } from './types'
 import {
   loadState as loadLocalState,
   persistState,
@@ -8,6 +8,23 @@ import {
 } from './mockApi'
 
 export const loadInitialState = () => loadLocalState()
+
+export async function checkSessionApi() {
+  try {
+    const result = await api<{ authenticated: boolean }>('/api/session')
+    return result.authenticated
+  } catch {
+    return false
+  }
+}
+
+export async function loginApi(password: string) {
+  return api<{ ok: boolean }>('/api/login', { method: 'POST', body: { password } })
+}
+
+export async function logoutApi() {
+  return api<{ ok: boolean }>('/api/logout', { method: 'POST' })
+}
 
 export async function refreshState(state: AppState) {
   const next = await api<AppState>('/api/state')
@@ -34,9 +51,9 @@ export async function deleteProviderApi(state: AppState, providerId: string) {
   }
 }
 
-export async function saveSettingsApi(state: AppState) {
+export async function saveSettingsApi(state: AppState, extra: Partial<GlobalSettings> = {}) {
   try {
-    const next = await api<AppState>('/api/settings', { method: 'POST', body: state.settings })
+    const next = await api<AppState>('/api/settings', { method: 'POST', body: { ...state.settings, ...extra } })
     assignState(state, next)
   } catch {
     persistState(state)
@@ -60,6 +77,7 @@ export async function runChecksApi(state: AppState, target: CheckTarget = {}) {
 async function api<T>(path: string, options: { method?: string; body?: unknown } = {}) {
   const response = await fetch(path, {
     method: options.method || 'GET',
+    credentials: 'include',
     headers: options.body === undefined ? undefined : { 'content-type': 'application/json' },
     body: options.body === undefined ? undefined : JSON.stringify(options.body)
   })
