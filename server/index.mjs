@@ -19,6 +19,10 @@ let proxyServer = null
 let proxyServerPort = null
 let activeProxyContext = null
 const sessions = new Set()
+const jobs = new Map()
+let checkQueue = Promise.resolve()
+let stateWriteQueue = Promise.resolve()
+let scheduleRunning = false
 
 const defaults = {
   providers: [],
@@ -100,6 +104,18 @@ async function saveState(state) {
   await writeFile(stateFile, JSON.stringify(state, null, 2))
 }
 
+async function updateState(mutator) {
+  const next = stateWriteQueue.then(async () => {
+    const state = await loadState()
+    const result = await mutator(state)
+    const finalState = result || state
+    await saveState(finalState)
+    return finalState
+  })
+  stateWriteQueue = next.catch(() => undefined)
+  return next
+}
+
 async function readJson(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
@@ -108,7 +124,13 @@ async function readJson(req) {
 }
 
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers })
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+    pragma: 'no-cache',
+    expires: '0',
+    ...headers
+  })
   res.end(JSON.stringify(body))
 }
 
@@ -184,23 +206,23 @@ function normalizeProvider(provider) {
 }
 
 async function upsertProvider(provider) {
-  const state = await loadState()
   const next = normalizeProvider(provider)
-  const index = state.providers.findIndex((item) => item.id === next.id)
-  if (index >= 0) state.providers.splice(index, 1, next)
-  else state.providers.unshift(next)
   await materializeProvider(next)
-  await saveState(state)
-  return state
+  return updateState((state) => {
+    const index = state.providers.findIndex((item) => item.id === next.id)
+    if (index >= 0) state.providers.splice(index, 1, next)
+    else state.providers.unshift(next)
+    return state
+  })
 }
 
 async function deleteProvider(id) {
-  const state = await loadState()
-  state.providers = state.providers.filter((item) => item.id !== id)
-  state.runs = state.runs.filter((item) => item.providerId !== id)
   await rm(join(dataDir, 'providers', safeId(id)), { recursive: true, force: true })
-  await saveState(state)
-  return state
+  return updateState((state) => {
+    state.providers = state.providers.filter((item) => item.id !== id)
+    state.runs = state.runs.filter((item) => item.providerId !== id)
+    return state
+  })
 }
 
 async function materializeProvider(provider, model, proxyBaseUrl = '') {
@@ -219,6 +241,9 @@ function buildCodexConfig(provider, model, proxyBaseUrl = '') {
     text = /^model\s*=\s*".*"/m.test(text)
       ? text.replace(/^model\s*=\s*".*"/m, `model = "${model.name}"`)
       : `model = "${model.name}"\n${text}`
+  }
+  if (!/env_key\s*=/m.test(text) && /\[model_providers\.[^\]\n]+\]/m.test(text)) {
+    text = text.replace(/(\[model_providers\.[^\]\n]+\]\n)/m, '$1env_key = "OPENAI_API_KEY"\n')
   }
   if (proxyBaseUrl) {
     text = /base_url\s*=\s*"[^"]*"/m.test(text)
@@ -415,31 +440,155 @@ function toLogDetail(exchange) {
   }
 }
 
-async function runChecks(target = {}, scheduled = false) {
+function touchJob(job, patch) {
+  if (!job) return
+  Object.assign(job, patch, { updatedAt: new Date().toISOString() })
+}
+
+function publicJob(job) {
+  if (!job) return null
+  return {
+    id: job.id,
+    status: job.status,
+    target: job.target,
+    total: job.total,
+    completed: job.completed,
+    success: job.success,
+    failed: job.failed,
+    currentProvider: job.currentProvider,
+    currentAgent: job.currentAgent,
+    currentModel: job.currentModel,
+    stage: job.stage,
+    message: job.message,
+    error: job.error,
+    runs: job.runs,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    done: job.done
+  }
+}
+
+function createJob(target = {}, scheduled = false) {
+  const now = new Date().toISOString()
+  return {
+    id: randomUUID(),
+    status: 'queued',
+    target,
+    scheduled,
+    total: 0,
+    completed: 0,
+    success: 0,
+    failed: 0,
+    currentProvider: '',
+    currentAgent: '',
+    currentModel: '',
+    stage: 'queued',
+    message: '等待检测队列',
+    error: '',
+    runs: [],
+    createdAt: now,
+    updatedAt: now,
+    done: false
+  }
+}
+
+function runQueued(task) {
+  const next = checkQueue.then(task, task)
+  checkQueue = next.catch(() => undefined)
+  return next
+}
+
+function enqueueCheck(target = {}) {
+  const job = createJob(target)
+  jobs.set(job.id, job)
+  runQueued(async () => {
+    touchJob(job, { status: 'running', stage: 'loading_state', message: '读取检测配置' })
+    try {
+      const result = await runChecks(target, false, job)
+      touchJob(job, {
+        status: 'completed',
+        stage: 'completed',
+        message: result.runs.length ? `检测完成：${result.runs.length} 条记录` : '没有可检测的模型',
+        runs: result.runs,
+        done: true
+      })
+    } catch (error) {
+      touchJob(job, {
+        status: 'failed',
+        stage: 'failed',
+        message: '检测任务失败',
+        error: error.message,
+        done: true
+      })
+    }
+  })
+  return job
+}
+
+async function runChecks(target = {}, scheduled = false, job = null) {
   const state = await loadState()
   if (scheduled && !state.settings.scheduleEnabled) return { state, runs: [] }
   const providers = state.providers.filter((provider) => provider.enabled && (!target.providerId || provider.id === target.providerId))
+  const targets = providers.flatMap((provider) => {
+    if (scheduled && !provider.scheduleEnabled) return []
+    return provider.models
+      .filter((item) => item.enabled)
+      .filter((model) => !target.agent || model.agent === target.agent)
+      .filter((model) => !target.modelName || model.name === target.modelName)
+      .filter((model) => !(scheduled && model.scheduleEnabled === false))
+      .filter((model) => !(model.agent === 'codex' && !provider.codexEnabled))
+      .filter((model) => !(model.agent === 'claude' && !provider.claudeEnabled))
+      .map((model) => ({ provider, model }))
+  })
   const runs = []
-  for (const provider of providers) {
-    if (scheduled && !provider.scheduleEnabled) continue
-    for (const model of provider.models.filter((item) => item.enabled)) {
-      if (target.agent && model.agent !== target.agent) continue
-      if (target.modelName && model.name !== target.modelName) continue
-      if (scheduled && model.scheduleEnabled === false) continue
-      if (model.agent === 'codex' && !provider.codexEnabled) continue
-      if (model.agent === 'claude' && !provider.claudeEnabled) continue
-      runs.push(await runOne(state, provider, model))
-      model.lastRunAt = new Date().toISOString()
-      model.nextRunAt = scheduled ? new Date(Date.now() + scheduleIntervalMs(state.settings)).toISOString() : model.nextRunAt || ''
-    }
-    provider.lastRunAt = new Date().toISOString()
-    provider.nextRunAt = state.settings.scheduleEnabled && provider.scheduleEnabled
-      ? new Date(Date.now() + scheduleIntervalMs(state.settings)).toISOString()
-      : ''
+  touchJob(job, {
+    total: targets.length,
+    completed: 0,
+    success: 0,
+    failed: 0,
+    stage: targets.length ? 'running' : 'completed',
+    message: targets.length ? `准备检测 ${targets.length} 个模型` : '没有可检测的模型'
+  })
+
+  for (const { provider, model } of targets) {
+    touchJob(job, {
+      currentProvider: provider.name,
+      currentAgent: model.agent,
+      currentModel: model.name,
+      stage: 'cli_running',
+      message: `正在检测 ${provider.name} / ${model.agent} / ${model.name}`
+    })
+    const run = await runOne(state, provider, model)
+    runs.push(run)
+    touchJob(job, {
+      completed: runs.length,
+      success: runs.filter((item) => item.state === 'success' || item.state === 'warning').length,
+      failed: runs.filter((item) => item.state === 'failed' || item.state === 'timeout').length,
+      stage: 'saving',
+      message: `已完成 ${runs.length}/${targets.length}`
+    })
   }
-  state.runs = [...runs, ...state.runs].slice(0, 5000)
-  await saveState(state)
-  return { state, runs }
+
+  if (!runs.length) return { state: await loadState(), runs }
+
+  const latest = await updateState((current) => {
+    current.runs = [...runs, ...current.runs].slice(0, 5000)
+    const intervalMs = scheduleIntervalMs(current.settings)
+    for (const run of runs) {
+      const provider = current.providers.find((item) => item.id === run.providerId)
+      if (!provider) continue
+      provider.lastRunAt = run.createdAt
+      provider.nextRunAt = current.settings.scheduleEnabled && provider.scheduleEnabled
+        ? new Date(Date.now() + intervalMs).toISOString()
+        : ''
+      const model = provider.models.find((item) => item.agent === run.agent && item.name === run.model)
+      if (!model) continue
+      model.lastRunAt = run.createdAt
+      if (scheduled) model.nextRunAt = new Date(Date.now() + intervalMs).toISOString()
+    }
+    return current
+  })
+  return { state: latest, runs }
 }
 
 async function runOne(state, provider, model) {
@@ -582,6 +731,9 @@ function execProcess(cmd, args, options) {
 }
 
 async function scheduleTick() {
+  if (scheduleRunning) return
+  scheduleRunning = true
+  try {
   const state = await loadState()
   if (!state.settings.scheduleEnabled) return
   const now = Date.now()
@@ -590,7 +742,10 @@ async function scheduleTick() {
     if (!provider.nextRunAt) return true
     return new Date(provider.nextRunAt).getTime() <= now
   })
-  for (const provider of due) await runChecks({ providerId: provider.id }, true)
+  for (const provider of due) await runQueued(() => runChecks({ providerId: provider.id }, true))
+  } finally {
+    scheduleRunning = false
+  }
 }
 
 async function serveStatic(req, res) {
@@ -637,21 +792,28 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs)
   if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req))))
   if (req.method === 'POST' && pathname === '/api/settings') {
-    const state = await loadState()
     const body = await readJson(req)
     if (body.adminPassword === '') delete body.adminPassword
-    state.settings = normalizeSettings({ ...state.settings, ...body })
-    await saveState(state)
+    const state = await updateState((current) => {
+      current.settings = normalizeSettings({ ...current.settings, ...body })
+      return current
+    })
     return send(res, 200, publicState(state))
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)
-    const result = await runChecks({
+    const job = enqueueCheck({
       providerId: body.providerId,
       agent: body.agent,
       modelName: body.modelName
     })
-    return send(res, 200, { ...result, state: publicState(result.state) })
+    return send(res, 202, { job: publicJob(job) })
+  }
+  const jobMatch = pathname.match(/^\/api\/checks\/([^/]+)$/)
+  if (req.method === 'GET' && jobMatch) {
+    const job = jobs.get(jobMatch[1])
+    if (!job) return send(res, 404, { error: 'job_not_found' })
+    return send(res, 200, { job: publicJob(job), state: job.done ? publicState(await loadState()) : undefined })
   }
   const deleteMatch = pathname.match(/^\/api\/providers\/([^/]+)$/)
   if (req.method === 'DELETE' && deleteMatch) return send(res, 200, publicState(await deleteProvider(deleteMatch[1])))

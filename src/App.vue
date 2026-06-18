@@ -37,8 +37,20 @@ import {
   modelsToText,
   recentRuns,
 } from './mockApi'
-import { checkSessionApi, deleteProviderApi, loadInitialState, loginApi, logoutApi, refreshState, runChecksApi, saveProviderApi, saveSettingsApi } from './api'
-import type { AgentType, AppState, ProviderConfig, RunState, TestRun } from './types'
+import {
+  ApiError,
+  checkSessionApi,
+  deleteProviderApi,
+  getCheckJobApi,
+  loadInitialState,
+  loginApi,
+  logoutApi,
+  refreshState,
+  saveProviderApi,
+  saveSettingsApi,
+  startChecksApi
+} from './api'
+import type { AgentType, AppState, CheckJob, ProviderConfig, RunState, TestRun } from './types'
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
@@ -116,6 +128,9 @@ const loginPassword = ref('')
 const loginLoading = ref(false)
 const newAdminPassword = ref('')
 const confirmAdminPassword = ref('')
+const checking = ref(false)
+const progressDrawer = ref(false)
+const activeJob = ref<CheckJob | null>(null)
 
 const filters = reactive({
   providerId: 'all',
@@ -138,6 +153,23 @@ const modelOptions = computed(() => {
   const names = visibleProviders.value.flatMap((provider) => provider.models.map((model) => model.name))
   return [...new Set(names)].sort((a, b) => a.localeCompare(b))
 })
+
+const jobPercent = computed(() => {
+  if (!activeJob.value?.total) return activeJob.value?.done ? 100 : 0
+  return Math.round((activeJob.value.completed / activeJob.value.total) * 100)
+})
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const handleApiError = (error: unknown, fallback: string) => {
+  if (error instanceof ApiError && error.status === 401) {
+    authenticated.value = false
+    ElMessage.error('登录已过期，请重新输入管理员密码')
+    return
+  }
+  const message = error instanceof Error ? error.message : fallback
+  ElMessage.error(message || fallback)
+}
 
 const providerModels = (provider: ProviderConfig) =>
   provider.models
@@ -168,10 +200,14 @@ const saveProvider = async () => {
   if (!activeProvider.value) return
   const draft = activeProvider.value
   syncActiveProviderModels()
-  await saveProviderApi(state, draft)
-  if (!selectedProviderId.value) selectedProviderId.value = draft.id
-  providerDrawer.value = false
-  ElMessage.success('已保存')
+  try {
+    await saveProviderApi(state, draft)
+    if (!selectedProviderId.value) selectedProviderId.value = draft.id
+    providerDrawer.value = false
+    ElMessage.success('已保存')
+  } catch (error) {
+    handleApiError(error, '保存提供商失败')
+  }
 }
 
 const deleteProvider = async (provider: ProviderConfig) => {
@@ -180,14 +216,38 @@ const deleteProvider = async (provider: ProviderConfig) => {
     confirmButtonText: '删除',
     cancelButtonText: '取消'
   })
-  await deleteProviderApi(state, provider.id)
-  if (selectedProviderId.value === provider.id) selectedProviderId.value = state.providers[0]?.id ?? ''
-  ElMessage.success('已删除')
+  try {
+    await deleteProviderApi(state, provider.id)
+    if (selectedProviderId.value === provider.id) selectedProviderId.value = state.providers[0]?.id ?? ''
+    ElMessage.success('已删除')
+  } catch (error) {
+    handleApiError(error, '删除提供商失败')
+  }
 }
 
 const runChecks = async (providerId?: string, agent?: AgentType, modelName?: string) => {
-  const created = await runChecksApi(state, { providerId, agent, modelName })
-  ElMessage.success(created.length ? `已生成 ${created.length} 条检测记录` : '没有可检测的模型')
+  if (checking.value) return
+  checking.value = true
+  progressDrawer.value = true
+  activeJob.value = null
+  try {
+    activeJob.value = await startChecksApi({ providerId, agent, modelName })
+    while (activeJob.value && !activeJob.value.done) {
+      await sleep(1000)
+      activeJob.value = await getCheckJobApi(state, activeJob.value.id)
+    }
+    if (activeJob.value?.status === 'failed') {
+      ElMessage.error(activeJob.value.error || '检测任务失败')
+    } else {
+      await refreshState(state)
+      const count = activeJob.value?.runs.length ?? 0
+      ElMessage.success(count ? `已生成 ${count} 条检测记录` : '没有可检测的模型')
+    }
+  } catch (error) {
+    handleApiError(error, '检测失败')
+  } finally {
+    checking.value = false
+  }
 }
 
 const openRun = (run: TestRun) => {
@@ -275,14 +335,38 @@ const saveSettings = async () => {
     }
     extra.adminPassword = newAdminPassword.value
   }
-  await saveSettingsApi(state, extra)
-  newAdminPassword.value = ''
-  confirmAdminPassword.value = ''
-  ElMessage.success('已保存')
+  try {
+    await saveSettingsApi(state, extra)
+    newAdminPassword.value = ''
+    confirmAdminPassword.value = ''
+    ElMessage.success('已保存')
+  } catch (error) {
+    handleApiError(error, '保存设置失败')
+  }
 }
 
 const saveTaskProvider = async (provider: ProviderConfig) => {
-  await saveProviderApi(state, provider)
+  try {
+    await saveProviderApi(state, provider)
+  } catch (error) {
+    handleApiError(error, '保存失败')
+  }
+}
+
+const saveScheduleSettings = async () => {
+  try {
+    await saveSettingsApi(state)
+  } catch (error) {
+    handleApiError(error, '保存定时任务失败')
+  }
+}
+
+const manualRefresh = async () => {
+  try {
+    await refreshState(state)
+  } catch (error) {
+    handleApiError(error, '刷新失败')
+  }
 }
 
 const navToProviders = () => {
@@ -413,7 +497,7 @@ onMounted(boot)
                 <el-option label="异常" value="failed" />
                 <el-option label="超时" value="timeout" />
               </el-select>
-              <el-button :icon="VideoPlay" type="primary" @click="runChecks()">检测全部</el-button>
+              <el-button :icon="VideoPlay" type="primary" :loading="checking" @click="runChecks()">检测全部</el-button>
             </div>
           </div>
 
@@ -429,7 +513,7 @@ onMounted(boot)
                 <div>
                   <el-tag v-if="provider.codexEnabled" effect="plain">Codex</el-tag>
                   <el-tag v-if="provider.claudeEnabled" effect="plain" type="success">Claude Code</el-tag>
-                  <el-button size="small" :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
+                  <el-button size="small" :icon="VideoPlay" :loading="checking" @click.stop="runChecks(provider.id)">检测</el-button>
                 </div>
               </div>
 
@@ -443,7 +527,7 @@ onMounted(boot)
                 <div v-for="model in providerModels(provider)" :key="model.id" class="table-row">
                   <span class="mono">{{ model.name }}</span>
                   <el-tag effect="plain" round>{{ agentLabel(model.agent) }}</el-tag>
-                  <el-button size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
+                  <el-button size="small" :icon="VideoPlay" :loading="checking" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
                   <div class="run-strip">
                     <button
                       v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
@@ -497,7 +581,7 @@ onMounted(boot)
                 </div>
               </div>
               <div class="card-actions">
-                <el-button :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
+                <el-button :icon="VideoPlay" :loading="checking" @click.stop="runChecks(provider.id)">检测</el-button>
                 <el-button :icon="EditPen" @click.stop.prevent="openEditProvider(provider)">编辑</el-button>
                 <el-button :icon="Delete" type="danger" plain @click="deleteProvider(provider)">删除</el-button>
               </div>
@@ -546,7 +630,7 @@ onMounted(boot)
       <section v-if="page === 'logs'" class="page-grid">
         <el-card shadow="never" class="glass-card">
           <div class="toolbar-only">
-            <el-button :icon="Refresh" @click="refreshState(state)">刷新</el-button>
+            <el-button :icon="Refresh" @click="manualRefresh">刷新</el-button>
           </div>
 
           <el-empty v-if="!latestLogs.length" description="暂无日志记录" />
@@ -578,12 +662,12 @@ onMounted(boot)
       <section v-if="page === 'tasks'" class="page-grid">
         <el-card shadow="never" class="glass-card">
           <div class="task-global">
-            <el-switch v-model="state.settings.scheduleEnabled" active-text="总定时任务" @change="saveSettingsApi(state)" />
-            <el-input-number v-model="state.settings.scheduleDays" :min="0" :max="365" @change="saveSettingsApi(state)" />
+            <el-switch v-model="state.settings.scheduleEnabled" active-text="总定时任务" @change="saveScheduleSettings" />
+            <el-input-number v-model="state.settings.scheduleDays" :min="0" :max="365" @change="saveScheduleSettings" />
             <span>天</span>
-            <el-input-number v-model="state.settings.scheduleHours" :min="0" :max="23" @change="saveSettingsApi(state)" />
+            <el-input-number v-model="state.settings.scheduleHours" :min="0" :max="23" @change="saveScheduleSettings" />
             <span>小时</span>
-            <el-input-number v-model="state.settings.scheduleMinutes" :min="0" :max="59" @change="saveSettingsApi(state)" />
+            <el-input-number v-model="state.settings.scheduleMinutes" :min="0" :max="59" @change="saveScheduleSettings" />
             <span>分钟</span>
           </div>
           <el-empty v-if="!state.providers.length" description="暂无模型提供商" />
@@ -636,6 +720,38 @@ onMounted(boot)
         </el-card>
       </section>
     </main>
+
+    <el-dialog v-model="progressDrawer" width="560px" class="check-progress-dialog" title="检测进度">
+      <div v-if="activeJob" class="check-progress">
+        <div class="progress-top">
+          <strong>{{ activeJob.message || '检测中' }}</strong>
+          <el-tag :type="activeJob.status === 'failed' ? 'danger' : activeJob.done ? 'success' : 'primary'">
+            {{ activeJob.status }}
+          </el-tag>
+        </div>
+        <div class="progress-bar">
+          <span :style="{ width: `${jobPercent}%` }"></span>
+        </div>
+        <div class="progress-grid">
+          <span>进度</span>
+          <b>{{ activeJob.completed }} / {{ activeJob.total }}</b>
+          <span>成功</span>
+          <b>{{ activeJob.success }}</b>
+          <span>失败</span>
+          <b>{{ activeJob.failed }}</b>
+          <span>阶段</span>
+          <b>{{ activeJob.stage }}</b>
+          <span>当前提供商</span>
+          <b>{{ activeJob.currentProvider || '-' }}</b>
+          <span>当前模型</span>
+          <b class="mono">{{ activeJob.currentModel || '-' }}</b>
+        </div>
+        <pre v-if="activeJob.error" class="progress-error">{{ activeJob.error }}</pre>
+      </div>
+      <div v-else class="check-progress">
+        <strong>正在创建检测任务...</strong>
+      </div>
+    </el-dialog>
 
     <el-dialog v-model="providerDrawer" width="860px" top="5vh" class="provider-config-dialog" title="模型提供商配置">
       <el-form v-if="activeProvider" label-position="top" class="provider-form">

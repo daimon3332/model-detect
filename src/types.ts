@@ -53,6 +53,26 @@ export interface CheckTarget {
   modelName?: string
 }
 
+export interface CheckJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  target: CheckTarget
+  total: number
+  completed: number
+  success: number
+  failed: number
+  currentProvider: string
+  currentAgent: AgentType | ''
+  currentModel: string
+  stage: string
+  message: string
+  error: string
+  runs: TestRun[]
+  createdAt: string
+  updatedAt: string
+  done: boolean
+}
+
 export interface HttpExchange {
   method?: string
   url?: string

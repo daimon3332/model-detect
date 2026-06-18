@@ -62,7 +62,7 @@ npm install
 npm run dev
 ```
 
-仅启动前端开发服务。后端不可用时，前端会回退到 localStorage mock，不能真实调用 CLI。
+仅启动前端开发服务。真实检测、保存 provider、日志和登录都需要后端服务。
 
 ### 指定端口启动
 
@@ -542,21 +542,101 @@ Proxy: socks5://127.0.0.1:7890
 
 ### `POST /api/checks`
 
-执行检测。
+创建后台检测任务，接口会立即返回，不等待 CLI 执行完成。
 
 请求体：
 
 ```json
 {
-  "providerId": "可选"
+  "providerId": "可选",
+  "agent": "可选，codex 或 claude",
+  "modelName": "可选"
 }
 ```
 
 不传 `providerId` 时检测全部启用 provider。
 
+返回：
+
+```json
+{
+  "job": {
+    "id": "job-id",
+    "status": "queued",
+    "total": 0,
+    "completed": 0,
+    "success": 0,
+    "failed": 0,
+    "stage": "queued",
+    "message": "等待检测队列",
+    "done": false
+  }
+}
+```
+
+### `GET /api/checks/:id`
+
+查询检测任务进度。
+
+返回字段包含：
+
+```text
+status: queued / running / completed / failed
+stage: 当前阶段
+message: 当前提示
+currentProvider: 当前提供商
+currentAgent: 当前 Agent
+currentModel: 当前模型
+total: 总数
+completed: 已完成
+success: 成功数
+failed: 失败数
+done: 是否结束
+```
+
+任务结束时返回最新 state，前端据此刷新 provider 和日志。
+
 ### `GET /api/logs`
 
 返回检测日志。
+
+
+## 状态同步和检测进度
+
+线上部署时，前端不再在 API 失败后写入 mock/localStorage 假数据。
+
+规则：
+
+```text
+/api/state 是唯一真实状态来源
+API 失败 -> 前端直接提示错误
+401 Unauthorized -> 回到管理员密码页面
+检测失败 -> 保存真实失败日志或显示任务错误
+```
+
+检测采用后台任务：
+
+```text
+点击检测
+  -> POST /api/checks 创建 job
+  -> 前端显示检测进度弹窗
+  -> 轮询 GET /api/checks/:id
+  -> job 完成后刷新 /api/state
+```
+
+后端检测任务串行执行，避免多个 CLI 同时使用内部抓包代理导致请求上下文串线。
+
+`state.json` 写入使用串行队列。检测结束时只合并新增 runs 和 lastRunAt，不会用检测开始时的旧 provider 列表覆盖最新配置。
+
+所有 `/api/*` 响应都会返回 no-store 缓存头，避免 Nginx、Cloudflare 或浏览器缓存接口数据。
+
+Nginx 反代一般不需要特殊修改，只要转发到 Node 服务端口即可。更新本项目代码后通常只需要重启 model-detect 服务；Nginx 配置没变就不用重启 Nginx。
+
+如果开启 Cloudflare 小黄云，仍建议明确配置：
+
+```text
+/api/* -> Bypass cache
+```
 
 ## 日志数据结构
 
@@ -768,3 +848,4 @@ crypto.randomUUID 可用时使用 crypto.randomUUID
 ```
 
 因此在普通 HTTP 页面下也可以正常添加模型提供商。
+
