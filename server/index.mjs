@@ -15,14 +15,12 @@ const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
 const maxCapturedBodyChars = 2_000_000
 
-let proxyServer = null
-let proxyServerPort = null
-let activeProxyContext = null
 const sessions = new Set()
 const jobs = new Map()
-let checkQueue = Promise.resolve()
 let stateWriteQueue = Promise.resolve()
 let scheduleRunning = false
+let activeChecks = 0
+const checkWaiters = []
 
 const defaults = {
   providers: [],
@@ -37,6 +35,7 @@ const defaults = {
     scheduleHours: 0,
     scheduleMinutes: 30,
     proxyPort: 7788,
+    maxConcurrentChecks: 3,
     logRetentionDays: 30,
     redactLogs: true,
     adminPassword: 'admin'
@@ -87,6 +86,7 @@ function normalizeSettings(settings = {}) {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
   merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
 }
@@ -277,28 +277,22 @@ function commandParts(value) {
   return parts.map((part) => part.replace(/^"|"$/g, ''))
 }
 
-async function startCaptureProxy(port) {
-  if (proxyServer && proxyServerPort === port) return
-  if (proxyServer) await new Promise((resolve) => proxyServer.close(resolve))
-
-  proxyServerPort = port
-  proxyServer = createServer((req, res) => {
-    proxyRequest(req, res).catch((error) => {
+async function createCaptureProxy(capture) {
+  const server = createServer((req, res) => {
+    proxyRequest(req, res, capture).catch((error) => {
       res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ error: error.message }))
     })
   })
-  await new Promise((resolve) => proxyServer.listen(port, '127.0.0.1', resolve))
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  return {
+    port: typeof address === 'object' && address ? address.port : 0,
+    close: () => new Promise((resolve) => server.close(resolve))
+  }
 }
 
-async function proxyRequest(req, res) {
-  const context = activeProxyContext
-  if (!context) {
-    res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({ error: 'proxy_context_not_ready' }))
-    return
-  }
-
+async function proxyRequest(req, res, context) {
   const started = Date.now()
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
@@ -432,13 +426,15 @@ function runtimeBaseUrlFor(provider, agent) {
   const lower = path.toLowerCase()
   const endpointPattern = /\/(v\d+\/)?(responses|chat\/completions|messages|completions)$/
   const gatewayPrefixes = ['/compat', '/openai-compatible', '/openai-compat', '/litellm', '/proxy', '/gateway']
-  if (!path || path === '/') {
+  if (agent === 'claude') {
+    url.pathname = path || '/'
+  } else if (!path || path === '/') {
     url.pathname = '/v1'
   } else if (/\/v\d+$/.test(lower) || endpointPattern.test(lower)) {
     url.pathname = path
   } else if (gatewayPrefixes.some((prefix) => lower.endsWith(prefix))) {
     url.pathname = path
-  } else if (agent === 'claude' || agent === 'codex') {
+  } else if (agent === 'codex') {
     url.pathname = `${path}/v1`
   }
   return url.toString().replace(/\/$/, '')
@@ -505,6 +501,7 @@ function publicJob(job) {
     message: job.message,
     error: job.error,
     runs: job.runs,
+    items: job.items,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     done: job.done
@@ -529,22 +526,76 @@ function createJob(target = {}, scheduled = false) {
     message: '等待检测队列',
     error: '',
     runs: [],
+    items: [],
     createdAt: now,
     updatedAt: now,
     done: false
   }
 }
 
-function runQueued(task) {
-  const next = checkQueue.then(task, task)
-  checkQueue = next.catch(() => undefined)
-  return next
+function runItemStatus(run) {
+  if (run.state === 'timeout') return 'timeout'
+  if (run.state === 'success' || run.state === 'warning') return 'success'
+  return 'failed'
+}
+
+function jobItemFromTarget(provider, model) {
+  return {
+    id: `${provider.id}:${model.agent}:${model.name}`,
+    providerId: provider.id,
+    providerName: provider.name,
+    agent: model.agent,
+    model: model.name,
+    status: 'queued',
+    httpStatus: null,
+    cliExitCode: null,
+    latencyMs: 0,
+    errorMessage: '',
+    runId: ''
+  }
+}
+
+function updateJobItem(job, itemId, patch) {
+  if (!job) return
+  const item = job.items.find((entry) => entry.id === itemId)
+  if (item) Object.assign(item, patch)
+  const completedItems = job.items.filter((entry) => ['success', 'failed', 'timeout'].includes(entry.status))
+  touchJob(job, {
+    completed: completedItems.length,
+    success: job.items.filter((entry) => entry.status === 'success').length,
+    failed: job.items.filter((entry) => entry.status === 'failed' || entry.status === 'timeout').length
+  })
+}
+
+async function acquireCheckSlot(maxConcurrent) {
+  const limit = Math.min(10, Math.max(1, Number(maxConcurrent || 3)))
+  if (activeChecks < limit) {
+    activeChecks += 1
+    return
+  }
+  await new Promise((resolve) => checkWaiters.push(resolve))
+  activeChecks += 1
+}
+
+function releaseCheckSlot() {
+  activeChecks = Math.max(0, activeChecks - 1)
+  const next = checkWaiters.shift()
+  if (next) next()
+}
+
+async function runWithCheckSlot(maxConcurrent, task) {
+  await acquireCheckSlot(maxConcurrent)
+  try {
+    return await task()
+  } finally {
+    releaseCheckSlot()
+  }
 }
 
 function enqueueCheck(target = {}) {
   const job = createJob(target)
   jobs.set(job.id, job)
-  runQueued(async () => {
+  Promise.resolve().then(async () => {
     touchJob(job, { status: 'running', stage: 'loading_state', message: '读取检测配置' })
     try {
       const result = await runChecks(target, false, job)
@@ -584,63 +635,82 @@ async function runChecks(target = {}, scheduled = false, job = null) {
       .map((model) => ({ provider, model }))
   })
   const runs = []
+  const items = targets.map(({ provider, model }) => jobItemFromTarget(provider, model))
   touchJob(job, {
     total: targets.length,
     completed: 0,
     success: 0,
     failed: 0,
+    items,
     stage: targets.length ? 'running' : 'completed',
     message: targets.length ? `准备检测 ${targets.length} 个模型` : '没有可检测的模型'
   })
 
-  for (const { provider, model } of targets) {
-    touchJob(job, {
-      currentProvider: provider.name,
-      currentAgent: model.agent,
-      currentModel: model.name,
-      stage: 'cli_running',
-      message: `正在检测 ${provider.name} / ${model.agent} / ${model.name}`
+  const maxConcurrent = state.settings.maxConcurrentChecks || 3
+  await Promise.all(targets.map(({ provider, model }) =>
+    runWithCheckSlot(maxConcurrent, async () => {
+      const itemId = `${provider.id}:${model.agent}:${model.name}`
+      updateJobItem(job, itemId, { status: 'running' })
+      touchJob(job, {
+        currentProvider: provider.name,
+        currentAgent: model.agent,
+        currentModel: model.name,
+        stage: 'cli_running',
+        message: `正在检测 ${provider.name} / ${model.agent} / ${model.name}`
+      })
+      try {
+        const run = await runOne(state, provider, model)
+        runs.push(run)
+        await saveRun(run, scheduled)
+        updateJobItem(job, itemId, {
+          status: runItemStatus(run),
+          httpStatus: run.httpStatus,
+          cliExitCode: run.cliExitCode,
+          latencyMs: run.latencyMs,
+          errorMessage: run.errorMessage,
+          runId: run.id
+        })
+      } catch (error) {
+        updateJobItem(job, itemId, {
+          status: 'failed',
+          errorMessage: error.message
+        })
+      }
+      touchJob(job, {
+        stage: 'running',
+        message: `已完成 ${job.completed}/${targets.length}`
+      })
     })
-    const run = await runOne(state, provider, model)
-    runs.push(run)
-    touchJob(job, {
-      completed: runs.length,
-      success: runs.filter((item) => item.state === 'success' || item.state === 'warning').length,
-      failed: runs.filter((item) => item.state === 'failed' || item.state === 'timeout').length,
-      stage: 'saving',
-      message: `已完成 ${runs.length}/${targets.length}`
-    })
-  }
+  ))
 
   if (!runs.length) return { state: await loadState(), runs }
 
-  const latest = await updateState((current) => {
-    current.runs = [...runs, ...current.runs].slice(0, 5000)
+  return { state: await loadState(), runs }
+}
+
+async function saveRun(run, scheduled = false) {
+  return updateState((current) => {
+    current.runs = [run, ...current.runs].slice(0, 5000)
     const intervalMs = scheduleIntervalMs(current.settings)
-    for (const run of runs) {
-      const provider = current.providers.find((item) => item.id === run.providerId)
-      if (!provider) continue
+    const provider = current.providers.find((item) => item.id === run.providerId)
+    if (provider) {
       provider.lastRunAt = run.createdAt
       provider.nextRunAt = current.settings.scheduleEnabled && provider.scheduleEnabled
         ? new Date(Date.now() + intervalMs).toISOString()
         : ''
       const model = provider.models.find((item) => item.agent === run.agent && item.name === run.model)
-      if (!model) continue
-      model.lastRunAt = run.createdAt
-      if (scheduled) model.nextRunAt = new Date(Date.now() + intervalMs).toISOString()
+      if (model) {
+        model.lastRunAt = run.createdAt
+        if (scheduled) model.nextRunAt = new Date(Date.now() + intervalMs).toISOString()
+      }
     }
     return current
   })
-  return { state: latest, runs }
 }
 
 async function runOne(state, provider, model) {
-  const proxyPort = Number(state.settings.proxyPort || 7788)
   const runtimeBaseUrl = runtimeBaseUrlFor(provider, model.agent)
   const runtimeProvider = { ...provider, baseUrl: runtimeBaseUrl }
-  const proxyBaseUrl = proxyBaseUrlFor(proxyPort, runtimeBaseUrl)
-  await startCaptureProxy(proxyPort)
-  await materializeProvider(runtimeProvider, model, proxyBaseUrl)
   const started = Date.now()
   const prompt = model.prompt || provider.prompt || state.settings.prompt || 'Hello'
   const base = providerBase(provider)
@@ -656,6 +726,10 @@ async function runOne(state, provider, model) {
     timeoutMs: Math.max(1000, timeoutMs - 3000),
     exchanges: []
   }
+  const proxy = await createCaptureProxy(capture)
+  const proxyBaseUrl = proxyBaseUrlFor(proxy.port, runtimeBaseUrl)
+  capture.proxyBaseUrl = proxyBaseUrl
+  await materializeProvider(runtimeProvider, model, proxyBaseUrl)
   const commonEnv = {
     ...process.env,
     OPENAI_API_KEY: provider.apiKey || process.env.OPENAI_API_KEY,
@@ -664,7 +738,6 @@ async function runOne(state, provider, model) {
   }
 
   let result
-  activeProxyContext = capture
   try {
     if (model.agent === 'codex') {
       const codexHome = join(base, 'codex-home')
@@ -693,7 +766,7 @@ async function runOne(state, provider, model) {
       })
     }
   } finally {
-    if (activeProxyContext === capture) activeProxyContext = null
+    await proxy.close()
   }
 
   const latencyMs = Date.now() - started
@@ -788,7 +861,7 @@ async function scheduleTick() {
     if (!provider.nextRunAt) return true
     return new Date(provider.nextRunAt).getTime() <= now
   })
-  for (const provider of due) await runQueued(() => runChecks({ providerId: provider.id }, true))
+  for (const provider of due) await runChecks({ providerId: provider.id }, true)
   } finally {
     scheduleRunning = false
   }

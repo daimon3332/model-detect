@@ -12,6 +12,7 @@ const defaultSettings: GlobalSettings = {
   scheduleHours: 0,
   scheduleMinutes: 30,
   proxyPort: 7788,
+  maxConcurrentChecks: 3,
   logRetentionDays: 30,
   redactLogs: true
 }
@@ -63,6 +64,7 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
   return merged
 }
 

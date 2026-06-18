@@ -159,6 +159,13 @@ const jobPercent = (job: CheckJob) => {
   return Math.round((job.completed / job.total) * 100)
 }
 
+const jobItemTagType = (status: string) => {
+  if (status === 'success') return 'success'
+  if (status === 'failed' || status === 'timeout') return 'danger'
+  if (status === 'running') return 'warning'
+  return 'info'
+}
+
 const upsertJob = (job: CheckJob) => {
   const index = activeJobs.value.findIndex((item) => item.id === job.id)
   if (index >= 0) activeJobs.value.splice(index, 1, job)
@@ -243,10 +250,15 @@ const runChecks = async (providerId?: string, agent?: AgentType, modelName?: str
 const pollJob = async (jobId: string) => {
   try {
     let job = activeJobs.value.find((item) => item.id === jobId)
+    let lastCompleted = job?.completed ?? 0
     while (job && !job.done) {
       await sleep(1000)
       job = await getCheckJobApi(state, jobId)
       upsertJob(job)
+      if (job.completed > lastCompleted) {
+        lastCompleted = job.completed
+        await refreshState(state)
+      }
     }
     if (job?.status === 'failed') {
       ElMessage.error(job.error || '检测任务失败')
@@ -530,6 +542,17 @@ onMounted(boot)
                 <span class="mono">{{ job.currentAgent || '-' }} / {{ job.currentModel || '-' }}</span>
                 <span>{{ job.stage }}</span>
               </div>
+              <div v-if="job.items?.length" class="job-item-list">
+                <div v-for="item in job.items" :key="item.id" class="job-item-row">
+                  <el-tag size="small" :type="jobItemTagType(item.status)" effect="plain">{{ item.status }}</el-tag>
+                  <span>{{ item.providerName }}</span>
+                  <span>{{ agentLabel(item.agent) }}</span>
+                  <span class="mono">{{ item.model }}</span>
+                  <span>{{ item.httpStatus ?? '-' }}</span>
+                  <span>{{ item.latencyMs ? `${item.latencyMs}ms` : '-' }}</span>
+                  <span class="job-item-error">{{ item.errorMessage || '-' }}</span>
+                </div>
+              </div>
               <pre v-if="job.error" class="progress-error">{{ job.error }}</pre>
             </article>
           </div>
@@ -740,6 +763,9 @@ onMounted(boot)
             <el-form-item label="日志保留天数">
               <el-input-number v-model="state.settings.logRetentionDays" :min="1" :max="365" />
             </el-form-item>
+            <el-form-item label="最大并发检测数">
+              <el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="10" />
+            </el-form-item>
             <el-form-item label="日志脱敏">
               <el-switch v-model="state.settings.redactLogs" />
             </el-form-item>
@@ -769,7 +795,7 @@ onMounted(boot)
           <el-form-item label="代理连接地址">
             <el-input v-model="activeProvider.proxyUrl" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890，留空直连" />
           </el-form-item>
-          <el-form-item label="CLI 超时">
+          <el-form-item label="CLI / 上游请求超时（秒）">
             <el-input-number v-model="activeProvider.timeoutSeconds" :min="5" :max="600" />
           </el-form-item>
         </div>

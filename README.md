@@ -444,10 +444,18 @@ https://gateway.test/openai  -> https://gateway.test/openai/v1 -> CLI 请求 /op
 Claude Code 运行时规则：
 
 ```text
-https://api.anthropic.com        -> https://api.anthropic.com/v1        -> CLI 请求 /v1/messages
-https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1 -> CLI 请求 /anthropic/v1/messages
-https://api.anthropic.com/v1     -> https://api.anthropic.com/v1     -> CLI 请求 /v1/messages
+https://api.anthropic.com           -> https://api.anthropic.com           -> CLI 请求 /v1/messages
+https://api.deepseek.com/anthropic  -> https://api.deepseek.com/anthropic  -> CLI 请求 /anthropic/v1/messages
+https://api.anthropic.com/v1        -> https://api.anthropic.com/v1        -> CLI 请求 /v1/v1/messages，不推荐这样填
 ```
+
+DeepSeek 官方 Claude Code 配置应填写：
+
+```text
+https://api.deepseek.com/anthropic
+```
+
+不要手动改成 `/anthropic/v1`。
 
 以下 path 视为网关前缀，不自动补 `/v1`：
 
@@ -646,7 +654,7 @@ failed: 失败数
 done: 是否结束
 ```
 
-任务结束时返回最新 state，前端据此刷新 provider 和日志。
+任务返回 `items[]`，每个模型一行展示 provider、agent、model、状态、HTTP 状态、CLI exit code、耗时、错误摘要和 runId。单个模型完成后会立即写入日志，前端轮询到 completed 增加时会刷新 provider 和日志。
 
 ### `GET /api/logs`
 
@@ -666,7 +674,7 @@ API 失败 -> 前端直接提示错误
 检测失败 -> 保存真实失败日志或显示任务错误
 ```
 
-检测采用后台任务，允许多个检测任务继续加入队列：
+检测采用后台任务，允许多个检测任务继续加入队列。后端使用并发池控制真实 CLI 检测，默认最大并发数是 `3`，可在“全局设置 -> 最大并发检测数”修改。
 
 ```text
 点击检测
@@ -676,11 +684,20 @@ API 失败 -> 前端直接提示错误
   -> job 完成后刷新 /api/state
 ```
 
-后端检测任务串行执行，避免多个 CLI 同时使用内部抓包代理导致请求上下文串线；前端不会阻止你继续点击其他 provider/model 检测，新任务会进入队列并在顶部任务区展示。
+每个检测 run 会启动一个独立的本地抓包代理端口，并由该代理闭包绑定自己的 capture context。多个 CLI 可以并发执行，不再共享全局 `activeProxyContext`，不会串请求日志。前端不会阻止你继续点击其他 provider/model 检测，新任务会进入并发池并在顶部任务区展示。
 
 `state.json` 写入使用串行队列。检测结束时只合并新增 runs 和 lastRunAt，不会用检测开始时的旧 provider 列表覆盖最新配置。
 
 所有 `/api/*` 响应都会返回 no-store 缓存头，避免 Nginx、Cloudflare 或浏览器缓存接口数据。
+
+
+检测超时是 provider 级配置：
+
+```text
+模型提供商 -> 编辑 -> CLI / 上游请求超时（秒）
+```
+
+默认 `90` 秒，范围 `5 - 600` 秒。该值同时约束 CLI 进程和上游代理请求；上游请求会比 CLI 总超时略早结束，以便日志中能保存 504/502 等代理错误响应。
 
 Nginx 反代一般不需要特殊修改，只要转发到 Node 服务端口即可。更新本项目代码后通常只需要重启 model-detect 服务；Nginx 配置没变就不用重启 Nginx。
 

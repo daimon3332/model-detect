@@ -2,104 +2,139 @@
 
 ## 本轮目标
 
-修复检测进度交互、首屏状态闪烁、Base URL 自动补全规则，并同步部署到 Linux 后对 `anyrouter`、`muyuan公益站`、`muyuan` 做短 prompt 验证。
+实现并发检测，但每个检测 run 使用独立本地代理端口和独立 capture context，避免请求日志串线；同时修复 DeepSeek Claude Code 路径补全、增强顶部任务进度、让单模型完成后立即保存并刷新。
 
-## 已确认问题
+## 当前问题
 
-1. 首屏会先显示 localStorage 旧数据，登录后再刷新服务端数据，导致 DeepSeek / 鲨鱼辣椒先出现，新 provider 过几秒才出现。
-2. 检测进度使用弹窗且前端有全局检测状态，一个模型检测中会影响其他模型继续点击检测。
-3. Base URL 不能简单补完整 endpoint。Codex CLI 自己请求 `/responses`，Claude Code 自己请求 `/messages`，项目只应该规范化 CLI 的 base_url。
-4. AI 网关常见习惯是让用户配置 API base，例如 `https://host/v1` 或网关前缀，客户端再追加 `/responses`、`/chat/completions`、`/messages`。
+1. 旧设计使用全局 `activeProxyContext` 和共享 `127.0.0.1:7788`，只能串行，否则多个 CLI 请求会串日志。
+2. 当前 job 只显示任务总进度，不显示每个 provider/model 的独立结果。
+3. 当前 runs 基本等任务结束后批量写入，不利于首页最近 10 次逐步更新。
+4. DeepSeek 官方 Claude Code 文档要求 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`，不能自动补成 `/anthropic/v1`，否则 Claude Code 追加 `/v1/messages` 后会变成错误路径。
+5. 当前超时默认 90 秒，前端已有 provider 级设置，但文案不够清楚；最大并发数还没有全局设置。
 
-## Base URL 规则
+## 设计
 
-### 原则
+### 1. 每个 run 独立代理
 
-- provider.baseUrl 原样保存，不静默改用户配置。
-- 检测运行时生成 runtimeBaseUrl。
-- 不把 Codex 的真实 `/responses` 请求自动改成 `/chat/completions`。
-- 完整 endpoint 输入保留但视为高级/不推荐，前端和 README 提醒用户应填写 API base。
-
-### Codex
-
-Codex CLI 默认最终请求：
+移除：
 
 ```text
-/v1/responses
+全局 127.0.0.1:7788
+全局 activeProxyContext
+全局串行 checkQueue
 ```
 
-运行时 base_url 规则：
+改为：
 
 ```text
-https://anyrouter.top -> https://anyrouter.top/v1
-https://shayulajiao.xyz/v1 -> https://shayulajiao.xyz/v1
-https://gateway.example.com/compat -> https://gateway.example.com/compat
-https://gateway.example.com/openai -> https://gateway.example.com/openai/v1
+runOne()
+  -> createCaptureProxy(capture)
+  -> 监听 127.0.0.1:0，由系统分配动态端口
+  -> proxy handler 闭包绑定 capture
+  -> CLI base_url 指向该 run 的独立代理端口
+  -> runOne finally 关闭代理
 ```
 
-### Claude Code
+这样多个 CLI 可以并发执行，每个请求只进入自己的 proxy/context。
 
-Claude Code 最终请求：
+### 2. 并发池
+
+保留队列概念，但改为 worker pool：
 
 ```text
-/v1/messages
+queued items -> runWithConcurrency(maxConcurrentChecks)
 ```
 
-运行时 base_url 规则：
+默认：
 
 ```text
-https://api.anthropic.com -> https://api.anthropic.com/v1
-https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1
-https://api.anthropic.com/v1 -> https://api.anthropic.com/v1
+settings.maxConcurrentChecks = 3
 ```
 
-### 网关前缀
-
-以下 path 视为网关兼容前缀，不自动补 `/v1`：
+限制范围：
 
 ```text
-/compat
-/openai-compatible
-/openai-compat
-/litellm
-/proxy
-/gateway
+1 - 10
 ```
 
-其他非 endpoint 自定义 path 默认补 `/v1`。
+### 3. job.items
 
-## 前端修改
+CheckJob 增加：
 
-1. `loadInitialState()` 不再加载 localStorage 中的旧 providers/runs。
-2. 登录检查完成并刷新 `/api/state` 后再展示服务端真实数据。
-3. 删除检测进度弹窗。
-4. 在模型监控页面顶部增加任务区：
-   - queued / running / completed / failed
-   - 当前 provider / agent / model
-   - completed / total
-   - success / failed
-   - stage / message / error
-5. 允许多个检测任务继续点击创建，后端排队执行。
-6. 每个 job 独立轮询，完成后刷新 state。
+```ts
+items: Array<{
+  id: string
+  providerId: string
+  providerName: string
+  agent: AgentType
+  model: string
+  status: 'queued' | 'running' | 'success' | 'failed' | 'timeout'
+  httpStatus: number | null
+  cliExitCode: number | null
+  latencyMs: number
+  errorMessage: string
+  runId: string
+}>
+```
 
-## 后端修改
+顶部任务区显示任务级和模型级：
 
-1. 增加 `runtimeBaseUrlFor(provider, agent)`。
-2. `runOne()` 使用 runtimeBaseUrl 生成：
-   - proxyBaseUrl
-   - capture.upstreamBaseUrl
-   - 写入 CLI 配置的 base_url
-3. 保持 CLI 原始 endpoint 行为。
+```text
+检测全部 running 2/5
+✅ anyrouter / codex / gpt5.5       404 failed
+⏳ muyuan公益站 / codex / gpt-5.5   running
+❌ muyuan / codex / gpt-5.5         timeout
+```
 
-## 文档更新
+### 4. 单模型完成即保存
 
-README 增加：
+流程：
 
-- Base URL 应填 API base，不是完整 endpoint。
-- Codex 最终请求 `/v1/responses`。
-- Claude Code 最终请求 `/v1/messages`。
-- OpenAI Chat Completions 是 `/v1/chat/completions`，但本项目默认不把 Codex 转成 chat completions。
-- 顶部任务进度区和多任务排队说明。
+```text
+runOne 完成
+  -> 立即 updateState 写入该 run
+  -> 更新 job.items 对应项
+  -> 更新 completed/success/failed
+  -> 前端轮询发现 completed 变化后 refreshState()
+```
+
+这样首页最近 10 次会逐步更新，不等整个 job 完成。
+
+### 5. Base URL 修正
+
+Codex：
+
+```text
+用户填 https://host        -> 运行时 https://host/v1 -> CLI 请求 /v1/responses
+用户填 https://host/v1     -> 保持 -> CLI 请求 /v1/responses
+```
+
+Claude Code：
+
+```text
+用户填 https://api.deepseek.com/anthropic -> 保持 -> CLI 请求 /anthropic/v1/messages
+用户填 https://api.anthropic.com          -> 保持 -> CLI 请求 /v1/messages
+```
+
+也就是 Claude 不自动给自定义 path 补 `/v1`。
+
+### 6. 前端
+
+1. 顶部任务区显示 job.items。
+2. 多个任务可以继续点击创建，互不阻塞。
+3. 轮询 job 时，如果 `completed` 增加，立即 `refreshState()`。
+4. 全局设置新增最大并发数。
+5. Provider 编辑中的 `CLI 超时` 文案改为 `CLI / 上游请求超时（秒）`。
+
+### 7. README
+
+更新：
+
+- 默认最大并发 3。
+- 每个检测 run 使用独立本地代理端口。
+- 单模型完成立即写日志。
+- Claude Code / DeepSeek Base URL 不自动补 `/v1`。
+- 超时设置位置和含义。
 
 ## 验证
 
@@ -123,12 +158,7 @@ fuser -k 20020/tcp || true
 PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
 
-测试 provider：
+短 prompt 验证：
 
-```text
-anyrouter
-muyuan公益站
-muyuan
-```
-
-只用短 prompt，查看成功/失败日志，不扩大测试范围。
+- DeepSeek / Claude Code，重点确认转发 URL 是 `https://api.deepseek.com/anthropic/v1/messages`。
+- 必要时再抽测 anyrouter / muyuan公益站 / muyuan，避免大量 token 消耗。

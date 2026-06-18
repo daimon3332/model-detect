@@ -42,6 +42,7 @@ export interface GlobalSettings {
   scheduleHours: number
   scheduleMinutes: number
   proxyPort: number
+  maxConcurrentChecks: number
   logRetentionDays: number
   redactLogs: boolean
   adminPassword?: string
@@ -68,9 +69,24 @@ export interface CheckJob {
   message: string
   error: string
   runs: TestRun[]
+  items: CheckJobItem[]
   createdAt: string
   updatedAt: string
   done: boolean
+}
+
+export interface CheckJobItem {
+  id: string
+  providerId: string
+  providerName: string
+  agent: AgentType
+  model: string
+  status: 'queued' | 'running' | 'success' | 'failed' | 'timeout'
+  httpStatus: number | null
+  cliExitCode: number | null
+  latencyMs: number
+  errorMessage: string
+  runId: string
 }
 
 export interface HttpExchange {
