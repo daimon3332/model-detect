@@ -1,4 +1,4 @@
-import type { AppState, CheckJob, CheckTarget, GlobalSettings, ProviderConfig } from './types'
+import type { AppState, CheckJob, CheckTarget, GlobalSettings, ProviderConfig, TestRun } from './types'
 import { loadState as loadLocalState } from './mockApi'
 
 export const loadInitialState = () => loadLocalState()
@@ -54,6 +54,10 @@ export async function clearRunsApi(state: AppState, target: CheckTarget = {}) {
   assignState(state, next)
 }
 
+export async function getRunApi(runId: string) {
+  return api<TestRun>(`/api/runs/${encodeURIComponent(runId)}`)
+}
+
 export async function saveSettingsApi(state: AppState, extra: Partial<GlobalSettings> = {}) {
   const next = await api<AppState>('/api/settings', { method: 'POST', body: { ...state.settings, ...extra } })
   assignState(state, next)
@@ -84,8 +88,8 @@ async function api<T>(path: string, options: { method?: string; body?: unknown }
   return (await response.json()) as T
 }
 
-function assignState(target: AppState, source: AppState) {
-  target.providers = source.providers ?? []
-  target.runs = source.runs ?? []
+function assignState(target: AppState, source: Partial<AppState>) {
+  if (source.providers) target.providers = source.providers
+  if (source.runs) target.runs = source.runs
   target.settings = { ...target.settings, ...(source.settings ?? {}) }
 }

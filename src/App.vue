@@ -43,6 +43,7 @@ import {
   clearRunsApi,
   deleteProviderApi,
   getCheckJobApi,
+  getRunApi,
   loadShellState,
   loginApi,
   logoutApi,
@@ -51,11 +52,11 @@ import {
   saveSettingsApi,
   startChecksApi
 } from './api'
-import type { AgentType, AppState, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun } from './types'
+import type { AgentType, AppState, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun, TestRunSummary } from './types'
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
-type DetailTab = 'request_headers' | 'request_body' | 'response_headers' | 'response_body' | 'forward_headers' | 'forward_body'
+type DetailTab = 'cli' | 'request_headers' | 'request_body' | 'response_headers' | 'response_body' | 'forward_headers' | 'forward_body'
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object'
 
@@ -119,7 +120,7 @@ const providerDrawer = ref(false)
 const runDrawer = ref(false)
 const activeProvider = ref<ProviderConfig | null>(null)
 const activeRun = ref<TestRun | null>(null)
-const activeDetailTab = ref<DetailTab>('request_headers')
+const activeDetailTab = ref<DetailTab>('cli')
 const codexModelText = ref('')
 const claudeModelText = ref('')
 const selectedProviderId = ref('')
@@ -195,7 +196,7 @@ const providerModels = (provider: ProviderConfig) =>
     })
 
 const openCreateProvider = () => {
-  activeProvider.value = createProviderDraft()
+  activeProvider.value = createProviderDraft(state.settings)
   codexModelText.value = ''
   claudeModelText.value = ''
   providerDrawer.value = true
@@ -291,13 +292,17 @@ const pollJob = async (jobId: string) => {
   }
 }
 
-const openRun = (run: TestRun) => {
-  activeRun.value = run
-  activeDetailTab.value = 'request_headers'
-  runDrawer.value = true
+const openRun = async (run: TestRunSummary) => {
+  activeDetailTab.value = 'cli'
+  try {
+    activeRun.value = await getRunApi(run.id)
+    runDrawer.value = true
+  } catch (error) {
+    handleApiError(error, '加载检测详情失败')
+  }
 }
 
-const openRunProvider = (run: TestRun) => {
+const openRunProvider = (run: TestRunSummary) => {
   const provider = state.providers.find((item) => item.id === run.providerId)
   if (!provider) return
   page.value = 'providers'
@@ -305,6 +310,7 @@ const openRunProvider = (run: TestRun) => {
 }
 
 const detailButtons: Array<{ key: DetailTab; label: string }> = [
+  { key: 'cli', label: 'CLI 输入输出' },
   { key: 'request_headers', label: '请求头' },
   { key: 'request_body', label: '请求体' },
   { key: 'response_headers', label: '响应头' },
@@ -316,6 +322,12 @@ const detailButtons: Array<{ key: DetailTab; label: string }> = [
 const detailContent = (run: TestRun) => {
   const detail = run.logDetail
   const values = {
+    cli: [
+      `Prompt:\n${run.prompt || ''}`,
+      `stdout:\n${run.stdout || ''}`,
+      `stderr:\n${run.stderr || ''}`,
+      `exit code:\n${run.cliExitCode ?? ''}`
+    ].join('\n\n'),
     request_headers: detail?.client_headers ?? run.request.headers,
     request_body: detail?.client_body ?? run.request.body,
     response_headers: detail?.provider_headers ?? run.response.headers,
@@ -818,6 +830,12 @@ onMounted(boot)
             </el-form-item>
             <el-form-item label="日志脱敏">
               <el-switch v-model="state.settings.redactLogs" />
+            </el-form-item>
+            <el-form-item label="Codex 默认 config.toml">
+              <el-input v-model="state.settings.defaultCodexConfig" type="textarea" :rows="14" class="code-input" />
+            </el-form-item>
+            <el-form-item label="Claude Code 默认 settings.json">
+              <el-input v-model="state.settings.defaultClaudeSettings" type="textarea" :rows="12" class="code-input" />
             </el-form-item>
             <el-form-item label="新管理员密码">
               <el-input v-model="newAdminPassword" type="password" show-password placeholder="留空表示不修改" />

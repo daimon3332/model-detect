@@ -2,119 +2,153 @@
 
 ## 本轮目标
 
-1. 将模型提供商默认超时时间从 `90` 秒改为 `20` 秒。
-2. 新增清空检测记录功能，支持三个层级：
-   - 全部检测记录
-   - 指定模型提供商的检测记录
-   - 指定模型提供商 + 指定 agent + 指定模型的检测记录
-3. 前端在模型监控页和日志记录页提供清空入口。
-4. 更新 README，说明默认超时和清空检测记录规则。
-5. 本地验证后提交、推送，并同步部署到 Linux `/root/model-detect`。
+1. 解决保存 provider/settings 和其他按钮响应慢的问题。
+2. 检测详情默认增加 `CLI 输入输出` 面板，展示 prompt/stdout/stderr/exit code。
+3. Codex 默认 `config.toml` 增加：
 
-## 设计细节
-
-### 1. 默认超时改为 20 秒
-
-后端：
-
-```js
-normalizeProvider(provider):
-  timeoutSeconds = Number(provider.timeoutSeconds || 20)
-
-runOne(...):
-  timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 20)) * 1000
+```toml
+model_instructions_file = "~/.codex/instruction.md"
 ```
 
-前端新建 provider 默认值同步改为：
+4. 在全局设置中增加 Codex 默认 `config.toml` 与 Claude Code 默认 `settings.json` 的编辑区域。
+5. 更新 README，说明性能优化、日志存储结构、详情加载方式和默认模板。
+6. 本地验证后提交、推送，并同步 Linux `/root/model-detect`。
+
+## 当前慢的原因
+
+现有设计把配置和日志全部放在一个 `data/state.json`：
+
+```text
+state.json = providers + settings + runs
+```
+
+每条 run 又包含完整请求头、请求体、响应头、响应体、SSE、stdout、stderr 等内容。日志变多后：
+
+```text
+保存 provider/settings
+  -> 读取巨大 state.json
+  -> 重写巨大 state.json
+  -> 返回完整 publicState
+  -> 前端解析大量 runs 详情
+```
+
+所以配置保存、刷新和部分按钮都会变慢。
+
+## 方案
+
+### 1. 配置与日志拆分
+
+改为：
+
+```text
+data/state.json  // providers + settings
+data/runs.json   // 检测记录
+```
+
+兼容旧数据：
+
+```text
+如果 runs.json 存在：runs 从 runs.json 读取
+如果 runs.json 不存在：从旧 state.json.runs 迁移读取
+保存 state 时不再写入完整 runs
+保存 run 时只写 runs.json
+```
+
+### 2. `/api/state` 返回轻量日志摘要
+
+新增摘要结构：
 
 ```ts
-timeoutSeconds: 20
-```
-
-Provider 编辑弹窗仍保留 `5 - 600` 秒范围。
-
-### 2. 清空检测记录 API
-
-新增后端接口：
-
-```http
-POST /api/runs/clear
-```
-
-请求体：
-
-```ts
-{
-  providerId?: string
-  agent?: 'codex' | 'claude'
-  modelName?: string
+RunSummary = {
+  id,
+  providerId,
+  providerName,
+  model,
+  agent,
+  state,
+  httpStatus,
+  cliExitCode,
+  latencyMs,
+  createdAt,
+  prompt,
+  errorMessage
 }
 ```
 
-清空规则：
+`/api/state` 只返回摘要 runs，不返回完整请求体/响应体。这样保存 provider/settings 后的响应会很小。
 
-```text
-无 providerId
-  -> 清空全部 runs
-
-providerId only
-  -> 清空该 provider 下全部 runs
-
-providerId + agent + modelName
-  -> 清空该 provider 下指定 agent/model 的 runs
-```
-
-为了避免页面显示旧状态，清空后同步维护运行时间字段：
-
-```text
-清空全部：
-  provider.lastRunAt = ''
-  provider.nextRunAt = ''
-  model.lastRunAt = ''
-  model.nextRunAt = ''
-
-清空 provider：
-  当前 provider.lastRunAt = ''
-  当前 provider.nextRunAt = ''
-  当前 provider 所有 model lastRunAt/nextRunAt = ''
-
-清空单模型：
-  当前 model lastRunAt/nextRunAt = ''
-  当前 provider.lastRunAt 根据剩余 runs 重新计算
-```
-
-### 3. 前端 API
+### 3. 新增完整 run 详情接口
 
 新增：
 
-```ts
-clearRunsApi(state, target)
+```http
+GET /api/runs/:id
 ```
 
-调用 `/api/runs/clear`，返回新的 `AppState` 后 `assignState`。
+点击状态码或日志详情时再拉完整 run，并打开详情弹窗。
 
-### 4. 前端入口
+### 4. CLI 输入输出详情页
 
-模型监控页：
+详情按钮顺序：
 
-- 顶部增加 `清空全部记录`。
-- provider 卡片增加 `清空该提供商记录`。
-- 每个模型行增加 `清空记录`。
+```text
+CLI 输入输出 | 请求头 | 请求体 | 响应头 | 响应体 | 网关路由转发头 | 网关路由转发体
+```
 
-日志记录页：
+默认展示 `CLI 输入输出`。
 
-- 增加 `清空全部记录`。
+内容：
 
-所有清空动作都先弹确认框，确认后调用 API 并刷新 state。
+```text
+Prompt:
+hello
 
-### 5. 文档
+stdout:
+Hello! How can I help?
 
-更新 README：
+stderr:
+...
 
-- 默认超时：`20s`。
-- 清空检测记录支持全部 / provider / provider+agent+model 三层级。
+exit code:
+0
+```
 
-## 验证
+### 5. 默认模板
+
+新增全局设置字段：
+
+```ts
+settings.defaultCodexConfig
+settings.defaultClaudeSettings
+```
+
+默认 Codex TOML：
+
+```toml
+model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+```
+
+新建 provider 使用全局默认模板；已有 provider 不自动覆盖。
+
+### 6. 保存性能
+
+保存 provider/settings 后：
+
+- 后端只写 `state.json`。
+- 响应只返回 provider/settings + run 摘要。
+- 不再传输完整 run body。
+
+### 7. 验证
 
 本地：
 

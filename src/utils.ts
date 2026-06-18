@@ -1,4 +1,4 @@
-import type { AgentType, RunState, TestRun } from './types'
+import type { AgentType, RunState, TestRunSummary } from './types'
 
 export const agentLabel = (agent: AgentType) => (agent === 'codex' ? 'Codex' : 'Claude Code')
 
@@ -13,7 +13,7 @@ export const stateLabel = (state: RunState) => {
   return labels[state]
 }
 
-export const runText = (run?: TestRun) => {
+export const runText = (run?: TestRunSummary) => {
   if (!run) return '—'
   if (run.state === 'timeout') return 'TIMEOUT'
   if (run.httpStatus) return String(run.httpStatus)
@@ -21,7 +21,7 @@ export const runText = (run?: TestRun) => {
   return 'ERR'
 }
 
-export const isHealthy = (run?: TestRun) => !!run && (run.state === 'success' || run.state === 'warning')
+export const isHealthy = (run?: TestRunSummary) => !!run && (run.state === 'success' || run.state === 'warning')
 
 export const formatTime = (value: string) =>
   new Intl.DateTimeFormat('zh-CN', {

@@ -176,6 +176,7 @@ PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 
 ```text
 state.json
+runs.json
 providers/
 管理员密码
 模型提供商配置
@@ -588,18 +589,18 @@ claude -p "hello"
 
 ### 1. 内部抓包代理
 
-后端为了记录 CLI 原始请求，会启动内部抓包代理：
+后端为了记录 CLI 原始请求，会为每个检测 run 独立启动一个动态端口的内部抓包代理：
 
 ```text
-http://127.0.0.1:7788
+http://127.0.0.1:<random-port>
 ```
 
-检测时，后端会把 CLI 的 Base URL 临时改成本地抓包代理。
+检测时，后端会把当前 run 的 CLI Base URL 临时改成本地抓包代理。不同模型并发检测时使用不同端口和不同 capture context，不再共享全局代理。
 
 Codex 示例：
 
 ```toml
-base_url = "http://127.0.0.1:7788/v1"
+base_url = "http://127.0.0.1:<random-port>/v1"
 ```
 
 Claude Code 示例：
@@ -607,7 +608,7 @@ Claude Code 示例：
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:7788/anthropic"
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:<random-port>/anthropic"
   }
 }
 ```
@@ -631,7 +632,7 @@ socks5://127.0.0.1:7890
 
 ```text
 CLI
-  -> 内部抓包代理 127.0.0.1:7788
+  -> 每个检测 run 独立启动的动态本地抓包代理 127.0.0.1:<random-port>
     -> 如果 provider.proxyUrl 为空：直连 provider
     -> 如果 provider.proxyUrl 是 http/https/socks/socks5：通过该代理访问 provider
 ```
@@ -722,7 +723,24 @@ done: 是否结束
 
 ### `GET /api/logs`
 
-返回检测日志。
+返回检测日志摘要。
+
+### `GET /api/runs/:id`
+
+返回单条检测记录完整详情，包括：
+
+```text
+prompt
+stdout
+stderr
+cliExitCode
+请求头 / 请求体
+响应头 / 响应体
+网关路由转发头 / 转发体
+exchanges[]
+```
+
+前端只有点击某条状态码或日志详情时才请求这个接口。
 
 
 ## 状态同步和检测进度
@@ -752,7 +770,14 @@ API 失败 -> 前端直接提示错误
 
 每个检测 run 也会创建独立临时 CLI 配置目录，避免同 provider 多模型并发时串 `model` 或串 `base_url`。前端不会阻止你继续点击其他 provider/model 检测，新任务会进入并发池并在顶部任务区展示。
 
-`state.json` 写入使用串行队列。检测结束时只合并新增 runs 和 lastRunAt，不会用检测开始时的旧 provider 列表覆盖最新配置。
+持久化文件已经拆分：
+
+```text
+data/state.json  // providers + settings
+data/runs.json   // 检测记录完整详情
+```
+
+`state.json` 和 `runs.json` 写入使用同一串行队列。保存 provider/settings 时只写 `state.json`，不会重写或返回完整检测日志；检测结束时只写 `runs.json` 并更新 lastRunAt/nextRunAt。
 
 所有 `/api/*` 响应都会返回 no-store 缓存头，避免 Nginx、Cloudflare 或浏览器缓存接口数据。
 
@@ -781,6 +806,24 @@ Nginx 反代一般不需要特殊修改，只要转发到 Node 服务端口即�
 
 ```text
 /api/* -> Bypass cache
+```
+
+
+## 默认 CLI 配置模板
+
+全局设置中可以编辑：
+
+```text
+Codex 默认 config.toml
+Claude Code 默认 settings.json
+```
+
+新建 provider 时会使用这两个模板，已有 provider 不会被自动覆盖。
+
+Codex 默认模板包含：
+
+```toml
+model_instructions_file = "~/.codex/instruction.md"
 ```
 
 ## 日志数据结构
@@ -843,6 +886,7 @@ httpStatus: 200
 详情页按钮顺序：
 
 ```text
+CLI 输入输出
 请求头
 请求体
 响应头
@@ -851,9 +895,9 @@ httpStatus: 200
 网关路由转发体
 ```
 
-默认打开 `请求头`。
+默认打开 `CLI 输入输出`，展示 prompt、stdout、stderr 和 cliExitCode。
 
-`CLI`、`全部交换`、`原始 JSON` 不再作为详情页主入口展示。
+`全部交换`、`原始 JSON` 不再作为详情页主入口展示。
 
 ## Linux 测试约束
 
@@ -875,19 +919,18 @@ hello
 
 ## 当前限制
 
-- 目前使用 JSON 文件保存状态，后续可换 SQLite。
+- 目前使用 JSON 文件保存配置和检测记录，后续可换 SQLite。
 - 当前代理不做 HTTPS MITM，只支持 CLI base_url 指向本地 HTTP 代理。
-- 前端当前不展示 `exchanges[]`，详情页展示请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
+- 前端当前不展示 `exchanges[]`，详情页展示 CLI 输入输出、请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
 - 日志体大小当前在后端截断，后续可做配置项。
 
 ## 后续计划
 
 1. 日志存储改 SQLite。
-2. 请求详情文件拆分保存，避免 `state.json` 过大。
-3. 日志详情增加多 exchange 切换器。
-4. 定时任务页展示上次运行和下次运行。
-5. 增加 systemd 服务文件。
-6. 增加日志清理策略。
+2. 日志详情增加多 exchange 切换器。
+3. 定时任务页展示上次运行和下次运行。
+4. 增加 systemd 服务文件。
+5. 增加日志清理策略。
 
 ## 当前前端页面
 

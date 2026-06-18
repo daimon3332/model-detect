@@ -45,6 +45,8 @@ export interface GlobalSettings {
   maxConcurrentChecks: number
   logRetentionDays: number
   redactLogs: boolean
+  defaultCodexConfig: string
+  defaultClaudeSettings: string
   adminPassword?: string
 }
 
@@ -68,7 +70,7 @@ export interface CheckJob {
   stage: string
   message: string
   error: string
-  runs: TestRun[]
+  runs: TestRunSummary[]
   items: CheckJobItem[]
   createdAt: string
   updatedAt: string
@@ -97,7 +99,7 @@ export interface HttpExchange {
   body: unknown
 }
 
-export interface TestRun {
+export interface TestRunSummary {
   id: string
   providerId: string
   providerName: string
@@ -109,9 +111,12 @@ export interface TestRun {
   latencyMs: number
   createdAt: string
   prompt: string
+  errorMessage: string
+}
+
+export interface TestRun extends TestRunSummary {
   stdout: string
   stderr: string
-  errorMessage: string
   request: HttpExchange
   response: HttpExchange
   logDetail?: {
@@ -149,6 +154,6 @@ export interface TestRun {
 
 export interface AppState {
   providers: ProviderConfig[]
-  runs: TestRun[]
+  runs: TestRunSummary[]
   settings: GlobalSettings
 }

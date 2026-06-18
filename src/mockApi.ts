@@ -14,18 +14,22 @@ const defaultSettings: GlobalSettings = {
   proxyPort: 7788,
   maxConcurrentChecks: 3,
   logRetentionDays: 30,
-  redactLogs: true
+  redactLogs: true,
+  defaultCodexConfig: '',
+  defaultClaudeSettings: ''
 }
 
 const defaultCodexConfig = `model = "gpt-5.5"
 model_provider = "provider"
 approval_policy = "never"
 sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
 
 [model_providers.provider]
 name = "Provider"
 base_url = "https://example.com/v1"
 wire_api = "responses"
+env_key = "OPENAI_API_KEY"
 `
 
 const defaultClaudeSettings = `{
@@ -39,7 +43,7 @@ const defaultClaudeSettings = `{
 
 export function loadState(): AppState {
   const raw = localStorage.getItem(key)
-  if (!raw) return { providers: [], runs: [], settings: defaultSettings }
+  if (!raw) return { providers: [], runs: [], settings: normalizeSettings() }
 
   try {
     const parsed = JSON.parse(raw) as AppState
@@ -49,7 +53,7 @@ export function loadState(): AppState {
       settings: normalizeSettings(parsed.settings)
     }
   } catch {
-    return { providers: [], runs: [], settings: defaultSettings }
+    return { providers: [], runs: [], settings: normalizeSettings() }
   }
 }
 
@@ -65,6 +69,8 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
+  merged.defaultCodexConfig = String(merged.defaultCodexConfig || defaultCodexConfig)
+  merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   return merged
 }
 
@@ -72,7 +78,7 @@ export function persistState(state: AppState) {
   localStorage.setItem(key, JSON.stringify(state))
 }
 
-export function createProviderDraft(): ProviderConfig {
+export function createProviderDraft(settings?: Partial<GlobalSettings>): ProviderConfig {
   return {
     id: createId(),
     name: '',
@@ -87,8 +93,8 @@ export function createProviderDraft(): ProviderConfig {
     scheduleEnabled: false,
     saveBody: true,
     models: [],
-    codexConfig: defaultCodexConfig,
-    claudeSettings: defaultClaudeSettings
+    codexConfig: settings?.defaultCodexConfig || defaultCodexConfig,
+    claudeSettings: settings?.defaultClaudeSettings || defaultClaudeSettings
   }
 }
 

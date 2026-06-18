@@ -11,9 +11,32 @@ import { ProxyAgent } from 'proxy-agent'
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const dataDir = resolve(process.env.MODEL_DETECT_DATA_DIR || join(root, 'data'))
 const stateFile = join(dataDir, 'state.json')
+const runsFile = join(dataDir, 'runs.json')
 const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
 const maxCapturedBodyChars = 2_000_000
+
+const defaultCodexConfig = `model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"
+`
+
+const defaultClaudeSettings = `{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://example.com/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_MODEL": ""
+  }
+}
+`
 
 const sessions = new Set()
 const jobs = new Map()
@@ -38,6 +61,8 @@ const defaults = {
     maxConcurrentChecks: 3,
     logRetentionDays: 30,
     redactLogs: true,
+    defaultCodexConfig,
+    defaultClaudeSettings,
     adminPassword: 'admin'
   }
 }
@@ -59,19 +84,47 @@ async function ensureData() {
   } catch {
     await saveState(defaults)
   }
+  await migrateLegacyRuns()
 }
 
-async function loadState() {
+async function migrateLegacyRuns() {
+  try {
+    await stat(runsFile)
+    return
+  } catch {}
+
+  try {
+    const parsed = JSON.parse(await readFile(stateFile, 'utf8'))
+    if (Array.isArray(parsed.runs) && parsed.runs.length) await saveRuns(parsed.runs)
+  } catch {}
+}
+
+async function loadState(options = {}) {
   await ensureData()
+  const includeRuns = options.includeRuns !== false
   try {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8'))
     return {
       providers: Array.isArray(parsed.providers) ? parsed.providers.map(normalizeProvider) : [],
-      runs: parsed.runs ?? [],
+      runs: includeRuns ? await loadRuns(parsed) : [],
       settings: normalizeSettings(parsed.settings)
     }
   } catch {
-    return structuredClone(defaults)
+    const fallback = structuredClone(defaults)
+    if (!includeRuns) fallback.runs = []
+    return fallback
+  }
+}
+
+async function loadRuns(fallbackState = null) {
+  await mkdir(dataDir, { recursive: true })
+  try {
+    const parsed = JSON.parse(await readFile(runsFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    const legacyRuns = Array.isArray(fallbackState?.runs) ? fallbackState.runs : []
+    if (legacyRuns.length) await saveRuns(legacyRuns)
+    return legacyRuns
   }
 }
 
@@ -87,6 +140,8 @@ function normalizeSettings(settings = {}) {
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
+  merged.defaultCodexConfig = String(merged.defaultCodexConfig || defaultCodexConfig)
+  merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
 }
@@ -101,16 +156,34 @@ function scheduleIntervalMs(settings) {
 
 async function saveState(state) {
   await mkdir(dataDir, { recursive: true })
-  await writeFile(stateFile, JSON.stringify(state, null, 2))
+  const { runs, ...persisted } = state
+  await writeFile(stateFile, JSON.stringify(persisted, null, 2))
+}
+
+async function saveRuns(runs) {
+  await mkdir(dataDir, { recursive: true })
+  await writeFile(runsFile, JSON.stringify(runs, null, 2))
 }
 
 async function updateState(mutator) {
   const next = stateWriteQueue.then(async () => {
-    const state = await loadState()
+    const state = await loadState({ includeRuns: false })
     const result = await mutator(state)
     const finalState = result || state
     await saveState(finalState)
     return finalState
+  })
+  stateWriteQueue = next.catch(() => undefined)
+  return next
+}
+
+async function updateRuns(mutator) {
+  const next = stateWriteQueue.then(async () => {
+    const runs = await loadRuns()
+    const result = await mutator(runs)
+    const finalRuns = result || runs
+    await saveRuns(finalRuns)
+    return finalRuns
   })
   stateWriteQueue = next.catch(() => undefined)
   return next
@@ -134,9 +207,28 @@ function send(res, status, body, headers = {}) {
   res.end(JSON.stringify(body))
 }
 
-function publicState(state) {
+function publicRunSummary(run) {
+  return {
+    id: run.id,
+    providerId: run.providerId,
+    providerName: run.providerName,
+    model: run.model,
+    agent: run.agent,
+    state: run.state,
+    httpStatus: run.httpStatus,
+    cliExitCode: run.cliExitCode,
+    latencyMs: run.latencyMs,
+    createdAt: run.createdAt,
+    prompt: run.prompt,
+    errorMessage: run.errorMessage
+  }
+}
+
+function publicState(state, options = {}) {
   const { adminPassword, ...settings } = state.settings
-  return { ...state, settings }
+  const result = { providers: state.providers, settings }
+  if (options.includeRuns !== false) result.runs = (state.runs || []).map(publicRunSummary)
+  return result
 }
 
 function parseCookies(req) {
@@ -206,9 +298,13 @@ function normalizeProvider(provider) {
 }
 
 async function upsertProvider(provider) {
-  const next = normalizeProvider(provider)
-  await materializeProvider(next)
-  return updateState((state) => {
+  return updateState(async (state) => {
+    const next = normalizeProvider({
+      ...provider,
+      codexConfig: provider.codexConfig || state.settings.defaultCodexConfig,
+      claudeSettings: provider.claudeSettings || state.settings.defaultClaudeSettings
+    })
+    await materializeProvider(next)
     const index = state.providers.findIndex((item) => item.id === next.id)
     if (index >= 0) state.providers.splice(index, 1, next)
     else state.providers.unshift(next)
@@ -218,30 +314,35 @@ async function upsertProvider(provider) {
 
 async function deleteProvider(id) {
   await rm(join(dataDir, 'providers', safeId(id)), { recursive: true, force: true })
-  return updateState((state) => {
-    state.providers = state.providers.filter((item) => item.id !== id)
-    state.runs = state.runs.filter((item) => item.providerId !== id)
-    return state
+  const nextRuns = await updateRuns((runs) => runs.filter((item) => item.providerId !== id))
+  const state = await updateState((current) => {
+    current.providers = current.providers.filter((item) => item.id !== id)
+    return current
   })
+  return { ...state, runs: nextRuns }
 }
 
 async function clearRuns(target = {}) {
-  return updateState((state) => {
-    const providerId = target.providerId || ''
-    const agent = target.agent || ''
-    const modelName = target.modelName || ''
+  const providerId = target.providerId || ''
+  const agent = target.agent || ''
+  const modelName = target.modelName || ''
+  const nextRuns = await updateRuns((runs) => {
     if (!providerId) {
-      state.runs = []
-      state.providers.forEach(resetProviderRuns)
-      return state
+      return []
     }
 
-    state.runs = state.runs.filter((run) => {
+    return runs.filter((run) => {
       if (run.providerId !== providerId) return true
       if (!agent || !modelName) return false
       return !(run.agent === agent && run.model === modelName)
     })
+  })
 
+  const state = await updateState((state) => {
+    if (!providerId) {
+      state.providers.forEach(resetProviderRuns)
+      return state
+    }
     const provider = state.providers.find((item) => item.id === providerId)
     if (!provider) return state
     if (!agent || !modelName) {
@@ -254,11 +355,12 @@ async function clearRuns(target = {}) {
       model.lastRunAt = ''
       model.nextRunAt = ''
     }
-    const latestProviderRun = latestRun(state.runs, providerId)
+    const latestProviderRun = latestRun(nextRuns, providerId)
     provider.lastRunAt = latestProviderRun?.createdAt || ''
     if (!latestProviderRun) provider.nextRunAt = ''
     return state
   })
+  return { ...state, runs: nextRuns }
 }
 
 function resetProviderRuns(provider) {
@@ -550,7 +652,7 @@ function publicJob(job) {
     stage: job.stage,
     message: job.message,
     error: job.error,
-    runs: job.runs,
+    runs: (job.runs || []).map(publicRunSummary),
     items: job.items,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -670,7 +772,7 @@ function enqueueCheck(target = {}) {
 }
 
 async function runChecks(target = {}, scheduled = false, job = null) {
-  const state = await loadState()
+  const state = await loadState({ includeRuns: false })
   if (scheduled && !state.settings.scheduleEnabled) return { state, runs: [] }
   const providers = state.providers.filter((provider) => provider.enabled && (!target.providerId || provider.id === target.providerId))
   const targets = providers.flatMap((provider) => {
@@ -733,14 +835,14 @@ async function runChecks(target = {}, scheduled = false, job = null) {
     })
   ))
 
-  if (!runs.length) return { state: await loadState(), runs }
+  if (!runs.length) return { state: await loadState({ includeRuns: false }), runs }
 
-  return { state: await loadState(), runs }
+  return { state: await loadState({ includeRuns: false }), runs }
 }
 
 async function saveRun(run, scheduled = false) {
+  await updateRuns((runs) => [run, ...runs].slice(0, 5000))
   return updateState((current) => {
-    current.runs = [run, ...current.runs].slice(0, 5000)
     const intervalMs = scheduleIntervalMs(current.settings)
     const provider = current.providers.find((item) => item.id === run.providerId)
     if (provider) {
@@ -906,7 +1008,7 @@ async function scheduleTick() {
   if (scheduleRunning) return
   scheduleRunning = true
   try {
-  const state = await loadState()
+  const state = await loadState({ includeRuns: false })
   if (!state.settings.scheduleEnabled) return
   const now = Date.now()
   const due = state.providers.filter((provider) => {
@@ -940,7 +1042,7 @@ async function handleApi(req, res, pathname) {
   }
   if (req.method === 'POST' && pathname === '/api/login') {
     const body = await readJson(req)
-    const state = await loadState()
+    const state = await loadState({ includeRuns: false })
     if (String(body.password || '') !== state.settings.adminPassword) {
       return send(res, 401, { error: 'invalid_password' })
     }
@@ -961,8 +1063,15 @@ async function handleApi(req, res, pathname) {
   if (!isAuthenticated(req)) return send(res, 401, { error: 'unauthorized' })
 
   if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
-  if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs)
-  if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req))))
+  if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs.map(publicRunSummary))
+  const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/)
+  if (req.method === 'GET' && runMatch) {
+    const runs = await loadRuns()
+    const run = runs.find((item) => item.id === runMatch[1])
+    if (!run) return send(res, 404, { error: 'run_not_found' })
+    return send(res, 200, run)
+  }
+  if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req)), { includeRuns: false }))
   if (req.method === 'POST' && pathname === '/api/runs/clear') return send(res, 200, publicState(await clearRuns(await readJson(req))))
   if (req.method === 'POST' && pathname === '/api/settings') {
     const body = await readJson(req)
@@ -971,7 +1080,7 @@ async function handleApi(req, res, pathname) {
       current.settings = normalizeSettings({ ...current.settings, ...body })
       return current
     })
-    return send(res, 200, publicState(state))
+    return send(res, 200, publicState(state, { includeRuns: false }))
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)
