@@ -65,7 +65,21 @@ export interface BackupData {
     providers: ProviderConfig[]
     settings: GlobalSettings
   }
-  runs: TestRun[]
+  runsIncluded?: boolean
+  runs?: TestRun[]
+}
+
+export interface BackupImportJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  stage: string
+  message: string
+  total: number
+  completed: number
+  error: string
+  createdAt: string
+  updatedAt: string
+  done: boolean
 }
 
 export interface CheckJob {

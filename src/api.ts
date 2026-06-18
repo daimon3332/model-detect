@@ -1,4 +1,4 @@
-import type { AgentType, AppState, BackupData, CheckJob, CheckTarget, GlobalSettings, ProviderConfig, TestRun } from './types'
+import type { AgentType, AppState, BackupData, BackupImportJob, CheckJob, CheckTarget, GlobalSettings, ProviderConfig, TestRun } from './types'
 import { loadState as loadLocalState } from './mockApi'
 
 export const loadInitialState = () => loadLocalState()
@@ -95,8 +95,14 @@ export async function exportBackupApi() {
 }
 
 export async function importBackupApi(state: AppState, backup: BackupData) {
-  const next = await api<AppState>('/api/backup/import', { method: 'POST', body: { backup, mode: 'replace' } })
-  assignState(state, next)
+  const result = await api<{ job: BackupImportJob }>('/api/backup/import', { method: 'POST', body: { backup, mode: 'replace' } })
+  return result.job
+}
+
+export async function getBackupImportJobApi(state: AppState, jobId: string) {
+  const result = await api<{ job: BackupImportJob; state?: AppState }>(`/api/backup/import/${encodeURIComponent(jobId)}`)
+  if (result.state) assignState(state, result.state)
+  return result.job
 }
 
 export async function startChecksApi(target: CheckTarget = {}) {

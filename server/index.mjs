@@ -20,6 +20,9 @@ const defaultCodexConfig = `model = "gpt-5.5"
 model_provider = "provider"
 approval_policy = "never"
 sandbox_mode = "read-only"
+model_verbosity = "low"
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
 model_instructions_file = "~/.codex/instruction.md"
 
 [model_providers.provider]
@@ -43,6 +46,7 @@ const defaultClaudeSettings = `{
 
 const sessions = new Set()
 const jobs = new Map()
+const backupJobs = new Map()
 let stateWriteQueue = Promise.resolve()
 let scheduleRunning = false
 let activeChecks = 0
@@ -56,7 +60,7 @@ const defaults = {
     claudeCommand: 'claude',
     dataDir: './data',
     prompt: 'Hello',
-    codexPrompt: 'Hello',
+    codexPrompt: 'Reply exactly: ok',
     claudePrompt: 'Reply exactly: ok',
     scheduleEnabled: false,
     scheduleDays: 0,
@@ -136,7 +140,12 @@ async function loadRuns(fallbackState = null) {
 function normalizeSettings(settings = {}) {
   const merged = { ...defaults.settings, ...settings }
   const legacyPrompt = String(settings.prompt || '').trim()
-  merged.codexPrompt = String(settings.codexPrompt || legacyPrompt || defaults.settings.codexPrompt)
+  const codexPrompt = String(settings.codexPrompt || '').trim()
+  merged.codexPrompt = codexPrompt && codexPrompt.toLowerCase() !== 'hello'
+    ? codexPrompt
+    : !codexPrompt && legacyPrompt && legacyPrompt.toLowerCase() !== 'hello'
+      ? legacyPrompt
+      : defaults.settings.codexPrompt
   merged.claudePrompt = String(
     settings.claudePrompt || (legacyPrompt && legacyPrompt.toLowerCase() !== 'hello' ? legacyPrompt : defaults.settings.claudePrompt)
   )
@@ -151,7 +160,9 @@ function normalizeSettings(settings = {}) {
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
-  merged.defaultCodexConfig = String(merged.defaultCodexConfig || defaultCodexConfig)
+  merged.defaultCodexConfig = ensureTomlSetting(String(merged.defaultCodexConfig || defaultCodexConfig), 'model_verbosity', '"low"')
+  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
+  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_summary', '"none"')
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
@@ -430,15 +441,14 @@ async function updateModelSchedule(body = {}) {
 
 async function exportBackup() {
   const state = await loadState({ includeRuns: false })
-  const runs = await loadRuns()
   return {
-    version: 1,
+    version: 2,
     exportedAt: new Date().toISOString(),
     state: {
       providers: state.providers,
       settings: state.settings
     },
-    runs
+    runsIncluded: false
   }
 }
 
@@ -454,18 +464,108 @@ async function importBackup(body = {}) {
         claudeSettings: provider.claudeSettings || settings.defaultClaudeSettings
       }))
     : []
-  const runs = Array.isArray(backup.runs) ? backup.runs : []
 
   const next = stateWriteQueue.then(async () => {
     await rm(join(dataDir, 'providers'), { recursive: true, force: true })
     const imported = { providers, settings, runs: [] }
     await saveState(imported)
-    await saveRuns(runs)
+    await saveRuns([])
     for (const provider of providers) await materializeProvider(provider)
-    return { ...imported, runs }
+    return imported
   })
   stateWriteQueue = next.catch(() => undefined)
   return next
+}
+
+function createBackupJob() {
+  const now = new Date().toISOString()
+  return {
+    id: randomUUID(),
+    status: 'queued',
+    stage: 'queued',
+    message: '等待导入',
+    total: 1,
+    completed: 0,
+    error: '',
+    createdAt: now,
+    updatedAt: now,
+    done: false
+  }
+}
+
+function touchBackupJob(job, patch) {
+  Object.assign(job, patch, { updatedAt: new Date().toISOString() })
+}
+
+function publicBackupJob(job) {
+  return job ? { ...job } : null
+}
+
+function enqueueBackupImport(body = {}) {
+  const job = createBackupJob()
+  backupJobs.set(job.id, job)
+  Promise.resolve().then(() => runBackupImportJob(job, body)).catch((error) => {
+    touchBackupJob(job, {
+      status: 'failed',
+      stage: 'failed',
+      message: '导入失败',
+      error: error.message,
+      done: true
+    })
+  })
+  return job
+}
+
+async function runBackupImportJob(job, body = {}) {
+  const backup = body.backup || body
+  if (!backup || typeof backup !== 'object') throw new Error('invalid_backup')
+  const sourceState = backup.state && typeof backup.state === 'object' ? backup.state : backup
+  const settings = normalizeSettings(sourceState.settings || {})
+  const providers = Array.isArray(sourceState.providers)
+    ? sourceState.providers.map((provider) => normalizeProvider({
+        ...provider,
+        codexConfig: provider.codexConfig || settings.defaultCodexConfig,
+        claudeSettings: provider.claudeSettings || settings.defaultClaudeSettings
+      }))
+    : []
+
+  touchBackupJob(job, {
+    status: 'running',
+    stage: 'saving_state',
+    message: '保存配置并清空检测记录',
+    total: providers.length + 2,
+    completed: 0
+  })
+
+  const next = stateWriteQueue.then(async () => {
+    await rm(join(dataDir, 'providers'), { recursive: true, force: true })
+    const imported = { providers, settings, runs: [] }
+    await saveState(imported)
+    await saveRuns([])
+    touchBackupJob(job, {
+      stage: 'rebuilding_provider_configs',
+      message: providers.length ? '重建模型提供商配置目录' : '没有模型提供商需要重建',
+      completed: 1
+    })
+    for (const [index, provider] of providers.entries()) {
+      touchBackupJob(job, {
+        stage: 'rebuilding_provider_configs',
+        message: `重建 ${provider.name || provider.id}`,
+        completed: index + 2
+      })
+      await materializeProvider(provider)
+    }
+    touchBackupJob(job, {
+      status: 'completed',
+      stage: 'completed',
+      message: '导入完成',
+      completed: providers.length + 2,
+      done: true
+    })
+    return imported
+  })
+  stateWriteQueue = next.catch(() => undefined)
+  await next
 }
 
 function resetProviderRuns(provider) {
@@ -494,6 +594,9 @@ async function materializeProvider(provider, model, proxyBaseUrl = '', base = pr
 
 function buildCodexConfig(provider, model, proxyBaseUrl = '') {
   let text = provider.codexConfig || ''
+  text = ensureTomlSetting(text, 'model_verbosity', '"low"')
+  text = ensureTomlSetting(text, 'model_reasoning_effort', '"low"')
+  text = ensureTomlSetting(text, 'model_reasoning_summary', '"none"')
   if (model?.agent === 'codex') {
     text = /^model\s*=\s*".*"/m.test(text)
       ? text.replace(/^model\s*=\s*".*"/m, `model = "${model.name}"`)
@@ -508,6 +611,11 @@ function buildCodexConfig(provider, model, proxyBaseUrl = '') {
       : `${text.trim()}\nbase_url = "${proxyBaseUrl}"`
   }
   return text.trim() + '\n'
+}
+
+function ensureTomlSetting(text, key, value) {
+  if (new RegExp(`^${key}\\s*=`, 'm').test(text)) return text
+  return `${key} = ${value}\n${text}`
 }
 
 function buildClaudeSettings(provider, model, proxyBaseUrl = '') {
@@ -1008,11 +1116,13 @@ async function runOne(state, provider, model) {
   try {
     if (model.agent === 'codex') {
       const codexHome = join(runBase, 'codex-home')
+      const codexWorkspace = join(runBase, 'codex-workspace')
+      await mkdir(codexWorkspace, { recursive: true })
       const [cmd, ...prefix] = commandParts(state.settings.codexCommand || 'codex')
       const envName = envKeyFromCodexConfig(buildCodexConfig(runtimeProvider, model, proxyBaseUrl))
       if (envName && provider.apiKey) commonEnv[envName] = provider.apiKey
-      result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--json', prompt], {
-        cwd: root,
+      result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--ephemeral', '--json', prompt], {
+        cwd: codexWorkspace,
         env: { ...commonEnv, CODEX_HOME: codexHome },
         timeoutMs
       })
@@ -1194,6 +1304,12 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs.map(publicRunSummary))
   if (req.method === 'GET' && pathname === '/api/backup/export') return send(res, 200, await exportBackup())
+  const backupJobMatch = pathname.match(/^\/api\/backup\/import\/([^/]+)$/)
+  if (req.method === 'GET' && backupJobMatch) {
+    const job = backupJobs.get(backupJobMatch[1])
+    if (!job) return send(res, 404, { error: 'backup_job_not_found' })
+    return send(res, 200, { job: publicBackupJob(job), state: job.done ? publicState(await loadState()) : undefined })
+  }
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/)
   if (req.method === 'GET' && runMatch) {
     const runs = await loadRuns()
@@ -1213,7 +1329,7 @@ async function handleApi(req, res, pathname) {
     return send(res, 200, publicState(await updateModelSchedule(await readJson(req)), { includeRuns: false }))
   }
   if (req.method === 'POST' && pathname === '/api/backup/import') {
-    return send(res, 200, publicState(await importBackup(await readJson(req))))
+    return send(res, 202, { job: publicBackupJob(enqueueBackupImport(await readJson(req))) })
   }
   if (req.method === 'POST' && pathname === '/api/settings') {
     const body = await readJson(req)

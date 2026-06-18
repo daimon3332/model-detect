@@ -254,3 +254,146 @@ node --check server/index.mjs
    - `MAX_THINKING_TOKENS=0`
    - `CLAUDE_CODE_EFFORT_LEVEL=low`
    - `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1`
+
+## 本轮实施确认
+
+用户已确认继续，并补充备份必须包含：
+
+```text
+providers
+提示词
+定时任务
+全局配置
+```
+
+不需要包含检测记录 runs。
+
+## 本轮目标
+
+1. Codex 改为更省 token 的默认检测方案。
+2. 备份导出不再包含测试记录，避免备份文件和导入过程被大日志拖慢。
+3. 备份导入仍导入 providers、提示词、定时任务、全局配置。
+4. 备份导入增加进度展示。
+5. 更新 README。
+6. 本地验证、提交、推送。
+
+## Codex 省 token 实施
+
+当前 Codex 检测已经使用每次 run 的临时 `CODEX_HOME`：
+
+```text
+data/providers/<provider-id>/run-contexts/<run-id>/codex-home
+```
+
+但当前 `cwd` 仍是项目根目录，因此 Codex 可能读取项目上下文、AGENTS.md、环境信息等。
+
+修改为：
+
+```text
+CODEX_HOME = data/providers/<provider-id>/run-contexts/<run-id>/codex-home
+cwd        = data/providers/<provider-id>/run-contexts/<run-id>/codex-workspace
+```
+
+这样 Codex 仍是真实 CLI 调用，但运行在空临时 workspace，减少项目上下文输入。
+
+Codex 命令增加：
+
+```bash
+--ephemeral
+```
+
+默认 Codex Prompt 改为：
+
+```text
+Reply exactly: ok
+```
+
+默认 Codex `config.toml` 增加：
+
+```toml
+model_verbosity = "low"
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
+```
+
+## 备份导出 / 导入实施
+
+导出结构改为：
+
+```json
+{
+  "version": 2,
+  "exportedAt": "ISO time",
+  "state": {
+    "providers": [],
+    "settings": {}
+  },
+  "runsIncluded": false
+}
+```
+
+导入规则：
+
+```text
+导入 providers/settings
+忽略 backup.runs
+清空当前 runs.json
+重建 provider 配置目录
+刷新前端状态
+```
+
+导入后的内容包括：
+
+```text
+providers
+provider prompt
+model prompt
+settings.codexPrompt
+settings.claudePrompt
+定时任务总开关和间隔
+provider/model 定时任务开关
+全局 CLI 命令、默认模板、并发数、日志配置、管理员密码等 settings
+```
+
+## 导入进度
+
+新增后台导入 job：
+
+```text
+POST /api/backup/import -> 返回 job
+GET /api/backup/import/:id -> 查询进度
+```
+
+job 字段：
+
+```ts
+{
+  id,
+  status: 'queued' | 'running' | 'completed' | 'failed',
+  stage,
+  message,
+  total,
+  completed,
+  error,
+  done
+}
+```
+
+前端导入流程：
+
+```text
+选择文件
+确认覆盖
+POST 创建导入任务
+显示导入进度弹窗
+轮询 job
+完成后 refreshState
+```
+
+## 验证
+
+```bash
+npm run typecheck
+npm run build
+node --check server/index.mjs
+```

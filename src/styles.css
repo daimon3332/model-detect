@@ -842,6 +842,11 @@ pre {
   margin: 12px 0 16px;
 }
 
+.backup-import-panel {
+  display: grid;
+  gap: 12px;
+}
+
 .job-card {
   display: grid;
   gap: 10px;

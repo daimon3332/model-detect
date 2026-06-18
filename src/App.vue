@@ -43,6 +43,7 @@ import {
   clearRunsApi,
   deleteProviderApi,
   exportBackupApi,
+  getBackupImportJobApi,
   getCheckJobApi,
   getRunApi,
   importBackupApi,
@@ -57,7 +58,7 @@ import {
   saveSettingsApi,
   startChecksApi
 } from './api'
-import type { AgentType, AppState, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun, TestRunSummary } from './types'
+import type { AgentType, AppState, BackupImportJob, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun, TestRunSummary } from './types'
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
@@ -137,6 +138,8 @@ const newAdminPassword = ref('')
 const confirmAdminPassword = ref('')
 const activeJobs = ref<CheckJob[]>([])
 const backupFileInput = ref<HTMLInputElement | null>(null)
+const backupImportDialog = ref(false)
+const backupImportJob = ref<BackupImportJob | null>(null)
 const scheduleSaving = reactive<Record<string, boolean>>({})
 
 const filters = reactive({
@@ -166,6 +169,12 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 const jobPercent = (job: CheckJob) => {
   if (!job.total) return job.done ? 100 : 0
   return Math.round((job.completed / job.total) * 100)
+}
+
+const backupJobPercent = (job: BackupImportJob | null) => {
+  if (!job) return 0
+  if (!job.total) return job.done ? 100 : 0
+  return Math.min(100, Math.round((job.completed / job.total) * 100))
 }
 
 const jobItemTagType = (status: string) => {
@@ -497,7 +506,7 @@ const exportBackup = async () => {
     link.download = `model-detect-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
     link.click()
     URL.revokeObjectURL(link.href)
-    ElMessage.success('已导出备份')
+    ElMessage.success('已导出备份（不包含检测记录）')
   } catch (error) {
     handleApiError(error, '导出备份失败')
   }
@@ -513,17 +522,37 @@ const importBackupFile = async (event: Event) => {
   input.value = ''
   if (!file) return
   try {
-    await ElMessageBox.confirm('导入会覆盖当前提供商、全局设置和检测记录，确认继续？', '导入备份', {
+    await ElMessageBox.confirm('导入会覆盖当前提供商、提示词、定时任务和全局设置，并清空当前检测记录，确认继续？', '导入备份', {
       type: 'warning',
       confirmButtonText: '导入',
       cancelButtonText: '取消'
     })
     const backup = JSON.parse(await file.text())
-    await importBackupApi(state, backup)
+    const job = await importBackupApi(state, backup)
+    backupImportJob.value = job
+    backupImportDialog.value = true
+    pollBackupImportJob(job.id)
+  } catch (error) {
+    if (error === 'cancel') return
+    handleApiError(error, '导入备份失败')
+  }
+}
+
+const pollBackupImportJob = async (jobId: string) => {
+  try {
+    let job = backupImportJob.value
+    while (job && !job.done) {
+      await sleep(600)
+      job = await getBackupImportJobApi(state, jobId)
+      backupImportJob.value = job
+    }
+    if (job?.status === 'failed') {
+      ElMessage.error(job.error || '导入备份失败')
+      return
+    }
     selectedProviderId.value = state.providers[0]?.id ?? ''
     ElMessage.success('已导入备份')
   } catch (error) {
-    if (error === 'cancel') return
     handleApiError(error, '导入备份失败')
   }
 }
@@ -981,6 +1010,28 @@ onMounted(boot)
         </el-card>
       </section>
     </main>
+
+    <el-dialog v-model="backupImportDialog" width="520px" title="导入备份进度" :close-on-click-modal="backupImportJob?.done === true">
+      <div v-if="backupImportJob" class="backup-import-panel">
+        <div class="job-card-head">
+          <strong>{{ backupImportJob.message }}</strong>
+          <el-tag :type="backupImportJob.status === 'failed' ? 'danger' : backupImportJob.done ? 'success' : 'primary'">
+            {{ backupImportJob.status }}
+          </el-tag>
+        </div>
+        <div class="progress-bar">
+          <span :style="{ width: `${backupJobPercent(backupImportJob)}%` }"></span>
+        </div>
+        <div class="job-meta">
+          <span>{{ backupImportJob.completed }} / {{ backupImportJob.total }}</span>
+          <span>{{ backupImportJob.stage }}</span>
+        </div>
+        <pre v-if="backupImportJob.error" class="progress-error">{{ backupImportJob.error }}</pre>
+      </div>
+      <template #footer>
+        <el-button :disabled="!backupImportJob?.done" type="primary" @click="backupImportDialog = false">完成</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="providerDrawer" width="860px" top="5vh" class="provider-config-dialog" title="模型提供商配置">
       <el-form v-if="activeProvider" label-position="top" class="provider-form">

@@ -7,7 +7,7 @@ const defaultSettings: GlobalSettings = {
   claudeCommand: 'claude',
   dataDir: './data',
   prompt: 'Hello',
-  codexPrompt: 'Hello',
+  codexPrompt: 'Reply exactly: ok',
   claudePrompt: 'Reply exactly: ok',
   scheduleEnabled: false,
   scheduleDays: 0,
@@ -25,6 +25,9 @@ const defaultCodexConfig = `model = "gpt-5.5"
 model_provider = "provider"
 approval_policy = "never"
 sandbox_mode = "read-only"
+model_verbosity = "low"
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
 model_instructions_file = "~/.codex/instruction.md"
 
 [model_providers.provider]
@@ -65,7 +68,12 @@ export function loadState(): AppState {
 function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   const merged = { ...defaultSettings, ...(settings ?? {}) }
   const legacyPrompt = String(settings?.prompt || '').trim()
-  merged.codexPrompt = String(settings?.codexPrompt || legacyPrompt || defaultSettings.codexPrompt)
+  const codexPrompt = String(settings?.codexPrompt || '').trim()
+  merged.codexPrompt = codexPrompt && codexPrompt.toLowerCase() !== 'hello'
+    ? codexPrompt
+    : !codexPrompt && legacyPrompt && legacyPrompt.toLowerCase() !== 'hello'
+      ? legacyPrompt
+      : defaultSettings.codexPrompt
   merged.claudePrompt = String(
     settings?.claudePrompt || (legacyPrompt && legacyPrompt.toLowerCase() !== 'hello' ? legacyPrompt : defaultSettings.claudePrompt)
   )
@@ -80,9 +88,16 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
-  merged.defaultCodexConfig = String(merged.defaultCodexConfig || defaultCodexConfig)
+  merged.defaultCodexConfig = ensureTomlSetting(String(merged.defaultCodexConfig || defaultCodexConfig), 'model_verbosity', '"low"')
+  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
+  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_summary', '"none"')
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   return merged
+}
+
+function ensureTomlSetting(text: string, key: string, value: string) {
+  if (new RegExp(`^${key}\\s*=`, 'm').test(text)) return text
+  return `${key} = ${value}\n${text}`
 }
 
 export function persistState(state: AppState) {

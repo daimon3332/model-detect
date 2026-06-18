@@ -200,7 +200,7 @@ API Key
 全局设置 -> 导入备份
 ```
 
-导入会覆盖新实例当前的 provider、settings 和 runs，并重建 provider 配置目录。备份文件包含 API Key、管理员密码配置、请求头、请求体、响应头、响应体、stdout/stderr 等敏感内容，不要上传到公开仓库或发给无关人员。
+导入会覆盖新实例当前的 provider、提示词、定时任务和全局配置，并重建 provider 配置目录。页面备份不包含检测记录，导入时也会清空当前检测记录，避免大日志拖慢迁移。备份文件仍包含 API Key、管理员密码配置等敏感内容，不要上传到公开仓库或发给无关人员。
 
 ### 停止后台服务
 
@@ -337,7 +337,7 @@ model.prompt
 默认全局 Prompt 分为两类：
 
 ```text
-Codex: Hello
+Codex: Reply exactly: ok
 Claude Code: Reply exactly: ok
 ```
 
@@ -575,7 +575,7 @@ data/providers/<provider-id>/codex-home/config.toml
 执行命令：
 
 ```bash
-codex exec --skip-git-repo-check --json "hello"
+codex exec --skip-git-repo-check --ephemeral --json "Reply exactly: ok"
 ```
 
 不会修改：
@@ -642,22 +642,26 @@ CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
 
 ### Codex 省 token 策略
 
-Codex 当前已使用非交互命令：
-
-```bash
-codex exec --skip-git-repo-check --json "Hello"
-```
-
-可选优化：
+Codex 当前使用每次 run 独立的临时配置和空临时 workspace：
 
 ```text
-1. 把 Codex 全局 Prompt 改成 Reply exactly: ok
-2. 在 Codex 默认 config.toml 中加入 model_verbosity = "low"
-3. 在 Codex 默认 config.toml 中加入 model_reasoning_effort = "low"
-4. 保持 model_reasoning_summary = "none"
+CODEX_HOME = data/providers/<provider-id>/run-contexts/<run-id>/codex-home
+cwd        = data/providers/<provider-id>/run-contexts/<run-id>/codex-workspace
 ```
 
-示例：
+后端实际调用：
+
+```bash
+codex exec --skip-git-repo-check --ephemeral --json "Reply exactly: ok"
+```
+
+默认 Codex 全局 Prompt：
+
+```text
+Reply exactly: ok
+```
+
+默认 Codex `config.toml` 包含：
 
 ```toml
 model_verbosity = "low"
@@ -673,7 +677,7 @@ model_reasoning_effort = "low" 降低 reasoning token 消耗
 model_reasoning_summary = "none" 不生成 reasoning summary
 ```
 
-更激进的方案是让 Codex 在完全空的临时 workspace 中运行，避免读取项目说明、AGENTS.md、仓库上下文等额外提示；但这样会更不像真实项目内 Codex CLI 调用。当前项目默认保留真实 CLI 行为，只把可控 prompt / verbosity / reasoning 调低。
+`--ephemeral` 用于避免持久化本次 Codex session 文件。空临时 workspace 用于减少项目说明、AGENTS.md、仓库上下文等额外输入 token；同时仍保留真实 Codex CLI 调用、本地代理抓包和 provider 隔离配置。
 
 ## 代理机制
 
@@ -802,11 +806,15 @@ Proxy: socks5://127.0.0.1:7890
 
 ### `GET /api/backup/export`
 
-导出完整备份 JSON，包含 provider、settings 和 runs。备份中包含 API Key、管理员密码配置、请求体/响应体日志等敏感内容，只能自己保存。
+导出备份 JSON，只包含 provider、提示词、定时任务和全局配置，不包含检测记录 runs。备份中包含 API Key、管理员密码配置等敏感内容，只能自己保存。
 
 ### `POST /api/backup/import`
 
-覆盖导入备份。导入后会重建 provider CLI 配置目录。
+覆盖导入备份。导入后会清空当前检测记录并重建 provider CLI 配置目录。前端会显示导入进度。
+
+### `GET /api/backup/import/:id`
+
+查询备份导入进度。
 
 ### `POST /api/checks`
 
@@ -966,6 +974,9 @@ Claude Code 默认 settings.json
 Codex 默认模板包含：
 
 ```toml
+model_verbosity = "low"
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
 model_instructions_file = "~/.codex/instruction.md"
 ```
 
