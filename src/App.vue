@@ -42,7 +42,7 @@ import {
   checkSessionApi,
   deleteProviderApi,
   getCheckJobApi,
-  loadInitialState,
+  loadShellState,
   loginApi,
   logoutApi,
   refreshState,
@@ -112,7 +112,7 @@ const pages: Array<{ key: PageKey; label: string; icon: unknown }> = [
   { key: 'settings', label: '全局设置', icon: Setting }
 ]
 
-const state = reactive<AppState>(loadInitialState())
+const state = reactive<AppState>(loadShellState())
 const page = ref<PageKey>('monitor')
 const providerDrawer = ref(false)
 const runDrawer = ref(false)
@@ -128,9 +128,7 @@ const loginPassword = ref('')
 const loginLoading = ref(false)
 const newAdminPassword = ref('')
 const confirmAdminPassword = ref('')
-const checking = ref(false)
-const progressDrawer = ref(false)
-const activeJob = ref<CheckJob | null>(null)
+const activeJobs = ref<CheckJob[]>([])
 
 const filters = reactive({
   providerId: 'all',
@@ -154,12 +152,18 @@ const modelOptions = computed(() => {
   return [...new Set(names)].sort((a, b) => a.localeCompare(b))
 })
 
-const jobPercent = computed(() => {
-  if (!activeJob.value?.total) return activeJob.value?.done ? 100 : 0
-  return Math.round((activeJob.value.completed / activeJob.value.total) * 100)
-})
-
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const jobPercent = (job: CheckJob) => {
+  if (!job.total) return job.done ? 100 : 0
+  return Math.round((job.completed / job.total) * 100)
+}
+
+const upsertJob = (job: CheckJob) => {
+  const index = activeJobs.value.findIndex((item) => item.id === job.id)
+  if (index >= 0) activeJobs.value.splice(index, 1, job)
+  else activeJobs.value.unshift(job)
+}
 
 const handleApiError = (error: unknown, fallback: string) => {
   if (error instanceof ApiError && error.status === 401) {
@@ -226,27 +230,33 @@ const deleteProvider = async (provider: ProviderConfig) => {
 }
 
 const runChecks = async (providerId?: string, agent?: AgentType, modelName?: string) => {
-  if (checking.value) return
-  checking.value = true
-  progressDrawer.value = true
-  activeJob.value = null
   try {
-    activeJob.value = await startChecksApi({ providerId, agent, modelName })
-    while (activeJob.value && !activeJob.value.done) {
+    const created = await startChecksApi({ providerId, agent, modelName })
+    upsertJob(created)
+    pollJob(created.id)
+    ElMessage.success('检测任务已加入队列')
+  } catch (error) {
+    handleApiError(error, '创建检测任务失败')
+  }
+}
+
+const pollJob = async (jobId: string) => {
+  try {
+    let job = activeJobs.value.find((item) => item.id === jobId)
+    while (job && !job.done) {
       await sleep(1000)
-      activeJob.value = await getCheckJobApi(state, activeJob.value.id)
+      job = await getCheckJobApi(state, jobId)
+      upsertJob(job)
     }
-    if (activeJob.value?.status === 'failed') {
-      ElMessage.error(activeJob.value.error || '检测任务失败')
+    if (job?.status === 'failed') {
+      ElMessage.error(job.error || '检测任务失败')
     } else {
       await refreshState(state)
-      const count = activeJob.value?.runs.length ?? 0
+      const count = job?.runs.length ?? 0
       ElMessage.success(count ? `已生成 ${count} 条检测记录` : '没有可检测的模型')
     }
   } catch (error) {
     handleApiError(error, '检测失败')
-  } finally {
-    checking.value = false
   }
 }
 
@@ -401,8 +411,8 @@ const logout = async () => {
 const boot = async () => {
   checkingAuth.value = true
   authenticated.value = await checkSessionApi()
-  checkingAuth.value = false
   if (authenticated.value) await refreshState(state).catch(() => undefined)
+  checkingAuth.value = false
 }
 
 watch(
@@ -497,8 +507,31 @@ onMounted(boot)
                 <el-option label="异常" value="failed" />
                 <el-option label="超时" value="timeout" />
               </el-select>
-              <el-button :icon="VideoPlay" type="primary" :loading="checking" @click="runChecks()">检测全部</el-button>
+              <el-button :icon="VideoPlay" type="primary" @click="runChecks()">检测全部</el-button>
             </div>
+          </div>
+
+          <div v-if="activeJobs.length" class="job-board">
+            <article v-for="job in activeJobs" :key="job.id" class="job-card" :class="job.status">
+              <div class="job-card-head">
+                <strong>{{ job.message || '检测任务' }}</strong>
+                <el-tag :type="job.status === 'failed' ? 'danger' : job.done ? 'success' : 'primary'">
+                  {{ job.status }}
+                </el-tag>
+              </div>
+              <div class="progress-bar">
+                <span :style="{ width: `${jobPercent(job)}%` }"></span>
+              </div>
+              <div class="job-meta">
+                <span>{{ job.completed }} / {{ job.total }}</span>
+                <span>成功 {{ job.success }}</span>
+                <span>失败 {{ job.failed }}</span>
+                <span>{{ job.currentProvider || '-' }}</span>
+                <span class="mono">{{ job.currentAgent || '-' }} / {{ job.currentModel || '-' }}</span>
+                <span>{{ job.stage }}</span>
+              </div>
+              <pre v-if="job.error" class="progress-error">{{ job.error }}</pre>
+            </article>
           </div>
 
           <el-empty v-if="!state.providers.length" description="暂无模型提供商">
@@ -513,7 +546,7 @@ onMounted(boot)
                 <div>
                   <el-tag v-if="provider.codexEnabled" effect="plain">Codex</el-tag>
                   <el-tag v-if="provider.claudeEnabled" effect="plain" type="success">Claude Code</el-tag>
-                  <el-button size="small" :icon="VideoPlay" :loading="checking" @click.stop="runChecks(provider.id)">检测</el-button>
+                  <el-button size="small" :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
                 </div>
               </div>
 
@@ -527,7 +560,7 @@ onMounted(boot)
                 <div v-for="model in providerModels(provider)" :key="model.id" class="table-row">
                   <span class="mono">{{ model.name }}</span>
                   <el-tag effect="plain" round>{{ agentLabel(model.agent) }}</el-tag>
-                  <el-button size="small" :icon="VideoPlay" :loading="checking" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
+                  <el-button size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
                   <div class="run-strip">
                     <button
                       v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
@@ -581,7 +614,7 @@ onMounted(boot)
                 </div>
               </div>
               <div class="card-actions">
-                <el-button :icon="VideoPlay" :loading="checking" @click.stop="runChecks(provider.id)">检测</el-button>
+                <el-button :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
                 <el-button :icon="EditPen" @click.stop.prevent="openEditProvider(provider)">编辑</el-button>
                 <el-button :icon="Delete" type="danger" plain @click="deleteProvider(provider)">删除</el-button>
               </div>
@@ -721,38 +754,6 @@ onMounted(boot)
       </section>
     </main>
 
-    <el-dialog v-model="progressDrawer" width="560px" class="check-progress-dialog" title="检测进度">
-      <div v-if="activeJob" class="check-progress">
-        <div class="progress-top">
-          <strong>{{ activeJob.message || '检测中' }}</strong>
-          <el-tag :type="activeJob.status === 'failed' ? 'danger' : activeJob.done ? 'success' : 'primary'">
-            {{ activeJob.status }}
-          </el-tag>
-        </div>
-        <div class="progress-bar">
-          <span :style="{ width: `${jobPercent}%` }"></span>
-        </div>
-        <div class="progress-grid">
-          <span>进度</span>
-          <b>{{ activeJob.completed }} / {{ activeJob.total }}</b>
-          <span>成功</span>
-          <b>{{ activeJob.success }}</b>
-          <span>失败</span>
-          <b>{{ activeJob.failed }}</b>
-          <span>阶段</span>
-          <b>{{ activeJob.stage }}</b>
-          <span>当前提供商</span>
-          <b>{{ activeJob.currentProvider || '-' }}</b>
-          <span>当前模型</span>
-          <b class="mono">{{ activeJob.currentModel || '-' }}</b>
-        </div>
-        <pre v-if="activeJob.error" class="progress-error">{{ activeJob.error }}</pre>
-      </div>
-      <div v-else class="check-progress">
-        <strong>正在创建检测任务...</strong>
-      </div>
-    </el-dialog>
-
     <el-dialog v-model="providerDrawer" width="860px" top="5vh" class="provider-config-dialog" title="模型提供商配置">
       <el-form v-if="activeProvider" label-position="top" class="provider-form">
         <div class="form-grid">
@@ -760,7 +761,7 @@ onMounted(boot)
             <el-input v-model="activeProvider.name" placeholder="例如 DeepSeek / 鲨鱼辣椒" />
           </el-form-item>
           <el-form-item label="Base URL">
-            <el-input v-model="activeProvider.baseUrl" placeholder="https://example.com/v1" />
+            <el-input v-model="activeProvider.baseUrl" placeholder="https://example.com 或 https://example.com/v1，不要填完整 endpoint" />
           </el-form-item>
           <el-form-item label="API Key">
             <el-input v-model="activeProvider.apiKey" show-password placeholder="sk-..." />

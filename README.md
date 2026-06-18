@@ -20,7 +20,7 @@ Node.js 建议使用 `^20.19.0` 或 `>=22.12.0`，因为当前项目使用 Vite 
 
 | 项目 | 是否必须 | 说明 |
 | --- | --- | --- |
-| 模型提供商 Base URL | 是 | 例如 OpenAI-compatible `/v1` 或 Anthropic-compatible 地址 |
+| 模型提供商 Base URL | 是 | 填 API base，例如 `https://host`、`https://host/v1`、`https://host/anthropic`，不要填完整 endpoint |
 | API Key | 是 | 在“模型提供商”页面配置 |
 | Git | 部署推荐 | 用于 `git clone` / `git pull` 更新项目 |
 | ufw | 可选 | Linux 开放端口时使用 |
@@ -410,6 +410,58 @@ data/providers/<provider-id>/claude-workspace/.claude/settings.json
 
 `data/` 已加入 `.gitignore`。
 
+
+## Base URL 和 Endpoint 规则
+
+模型提供商里填写的是 API base，不是完整 endpoint。
+
+标准 endpoint：
+
+```text
+OpenAI Responses: POST /v1/responses
+OpenAI Chat Completions: POST /v1/chat/completions
+Anthropic Messages: POST /v1/messages
+```
+
+本项目调用真实 CLI，不把 Codex 请求强行转换成 Chat Completions：
+
+```text
+Codex CLI -> /responses
+Claude Code CLI -> /messages
+```
+
+因此项目只在运行时规范化 `base_url`，不修改保存的 provider 配置。
+
+Codex 运行时规则：
+
+```text
+https://anyrouter.top        -> https://anyrouter.top/v1        -> CLI 请求 /v1/responses
+https://shayulajiao.xyz/v1   -> https://shayulajiao.xyz/v1   -> CLI 请求 /v1/responses
+https://gateway.test/compat  -> https://gateway.test/compat  -> CLI 请求 /compat/responses
+https://gateway.test/openai  -> https://gateway.test/openai/v1 -> CLI 请求 /openai/v1/responses
+```
+
+Claude Code 运行时规则：
+
+```text
+https://api.anthropic.com        -> https://api.anthropic.com/v1        -> CLI 请求 /v1/messages
+https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1 -> CLI 请求 /anthropic/v1/messages
+https://api.anthropic.com/v1     -> https://api.anthropic.com/v1     -> CLI 请求 /v1/messages
+```
+
+以下 path 视为网关前缀，不自动补 `/v1`：
+
+```text
+/compat
+/openai-compatible
+/openai-compat
+/litellm
+/proxy
+/gateway
+```
+
+如果某个 OpenAI-compatible 网关只支持 `/v1/chat/completions`，Codex 的真实 `/v1/responses` 检测可能失败；这属于上游网关能力问题，日志会展示真实请求和响应。
+
 ## Codex 隔离配置
 
 检测 Codex 时，后端设置：
@@ -614,17 +666,17 @@ API 失败 -> 前端直接提示错误
 检测失败 -> 保存真实失败日志或显示任务错误
 ```
 
-检测采用后台任务：
+检测采用后台任务，允许多个检测任务继续加入队列：
 
 ```text
 点击检测
   -> POST /api/checks 创建 job
-  -> 前端显示检测进度弹窗
+  -> 前端在模型监控页顶部显示检测任务进度
   -> 轮询 GET /api/checks/:id
   -> job 完成后刷新 /api/state
 ```
 
-后端检测任务串行执行，避免多个 CLI 同时使用内部抓包代理导致请求上下文串线。
+后端检测任务串行执行，避免多个 CLI 同时使用内部抓包代理导致请求上下文串线；前端不会阻止你继续点击其他 provider/model 检测，新任务会进入队列并在顶部任务区展示。
 
 `state.json` 写入使用串行队列。检测结束时只合并新增 runs 和 lastRunAt，不会用检测开始时的旧 provider 列表覆盖最新配置。
 

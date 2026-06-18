@@ -1,70 +1,134 @@
 # Plan
 
-## 目标
+## 本轮目标
 
-修复线上使用 Nginx/域名访问时出现的状态不同步、假数据、刷新后 provider/log 丢失、检测无反馈、401 被前端吞掉的问题，并同步部署到 Linux `/root/model-detect`。
+修复检测进度交互、首屏状态闪烁、Base URL 自动补全规则，并同步部署到 Linux 后对 `anyrouter`、`muyuan公益站`、`muyuan` 做短 prompt 验证。
 
-## 问题判断
+## 已确认问题
 
-1. 前端 API 失败后会 fallback 到 `mockApi.ts` 和 localStorage，导致真实后端失败时页面仍显示“成功”。截图里的 `user-agent: codex_exec` 来自 mock 数据，不是真实 CLI。
-2. `/api/checks` 是长请求，前端没有进度；Nginx/浏览器/session 任何环节出错时用户只能干等。
-3. 后端检测开始时读取旧 `state.json`，结束时整体保存，可能覆盖检测期间新增/修改的 provider。
-4. 管理员 session 在内存里，服务重启后旧 cookie 会 401；前端没有统一处理 401，进一步触发 mock fallback。
-5. API 响应缺少强制 no-store 头，虽然当前未开 Cloudflare 小黄云，也应该避免中间层缓存 API。
+1. 首屏会先显示 localStorage 旧数据，登录后再刷新服务端数据，导致 DeepSeek / 鲨鱼辣椒先出现，新 provider 过几秒才出现。
+2. 检测进度使用弹窗且前端有全局检测状态，一个模型检测中会影响其他模型继续点击检测。
+3. Base URL 不能简单补完整 endpoint。Codex CLI 自己请求 `/responses`，Claude Code 自己请求 `/messages`，项目只应该规范化 CLI 的 base_url。
+4. AI 网关常见习惯是让用户配置 API base，例如 `https://host/v1` 或网关前缀，客户端再追加 `/responses`、`/chat/completions`、`/messages`。
 
-## 实施方案
+## Base URL 规则
 
-### 后端
+### 原则
 
-1. 给所有 `/api/*` 响应增加：
-   - `Cache-Control: no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0`
-   - `Pragma: no-cache`
-   - `Expires: 0`
-2. 增加状态写入队列 `updateState(mutator)`：
-   - provider 保存、删除、settings 保存、检测日志写入都串行更新 `state.json`。
-   - 检测完成时重新读取最新 state，只合并 runs 和 lastRunAt，不用检测开始时的旧 provider 覆盖最新配置。
-3. 增加检测任务队列：
-   - `POST /api/checks` 不再等待 CLI 完成，立即返回 `jobId` 和初始 job。
-   - 后端串行执行检测，避免多个 CLI 共享内部抓包代理时互相覆盖 `activeProxyContext`。
-   - `GET /api/checks/:id` 返回进度：queued/running/completed/failed、当前 provider/model/agent、stage、completed/total、success/failed、message/error。
-4. 保留定时任务，但也使用相同的串行检测逻辑，避免并发冲突。
-5. CLI 执行失败、超时、未捕获 exchange 时仍保存真实错误 run，不再依赖前端 mock。
+- provider.baseUrl 原样保存，不静默改用户配置。
+- 检测运行时生成 runtimeBaseUrl。
+- 不把 Codex 的真实 `/responses` 请求自动改成 `/chat/completions`。
+- 完整 endpoint 输入保留但视为高级/不推荐，前端和 README 提醒用户应填写 API base。
 
-### 前端
+### Codex
 
-1. 移除真实 API 的 mock fallback：
-   - 保存 provider 失败就提示错误。
-   - 检测失败就提示错误。
-   - 401 统一提示登录过期并回到登录页。
-2. `loadInitialState` 仍可读取本地空状态用于首屏，但认证成功后以 `/api/state` 为唯一真实来源。
-3. 检测按钮调用异步任务：
-   - `POST /api/checks` 获取 job。
-   - 轮询 `GET /api/checks/:id`。
-   - 弹窗展示进度、当前阶段、当前模型、完成数量、成功/失败数量、错误信息。
-   - job 完成后刷新 `/api/state`。
-4. 检测期间按钮显示 loading，避免重复点击。
-5. 检测请求或轮询遇到 401：立即退出登录态，不再显示假成功。
+Codex CLI 默认最终请求：
 
-### 文档
+```text
+/v1/responses
+```
 
-更新 README：
+运行时 base_url 规则：
 
-1. 说明现在真实部署不使用 mock fallback。
-2. 说明检测任务是后台异步任务，有进度弹窗。
-3. 说明 API no-store 和 Nginx/Cloudflare `/api/*` 不缓存要求。
-4. 补充 Linux 更新后只需重启 model-detect 服务，Nginx 通常不用动。
+```text
+https://anyrouter.top -> https://anyrouter.top/v1
+https://shayulajiao.xyz/v1 -> https://shayulajiao.xyz/v1
+https://gateway.example.com/compat -> https://gateway.example.com/compat
+https://gateway.example.com/openai -> https://gateway.example.com/openai/v1
+```
 
-### 验证与部署
+### Claude Code
 
-1. 本地运行：
-   - `npm run typecheck`
-   - `npm run build`
-   - `node --check server/index.mjs`
-2. Git 提交并推送。
-3. Linux 只操作 `/root/model-detect`：
-   - `git pull`
-   - `npm install`
-   - `npm run build`
-   - `fuser -k 20020/tcp || true`
-   - `PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid`
-4. 用浏览器/MCP 访问域名或 IP，验证登录页/首页可打开。不触发真实模型检测，避免消耗 token。
+Claude Code 最终请求：
+
+```text
+/v1/messages
+```
+
+运行时 base_url 规则：
+
+```text
+https://api.anthropic.com -> https://api.anthropic.com/v1
+https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1
+https://api.anthropic.com/v1 -> https://api.anthropic.com/v1
+```
+
+### 网关前缀
+
+以下 path 视为网关兼容前缀，不自动补 `/v1`：
+
+```text
+/compat
+/openai-compatible
+/openai-compat
+/litellm
+/proxy
+/gateway
+```
+
+其他非 endpoint 自定义 path 默认补 `/v1`。
+
+## 前端修改
+
+1. `loadInitialState()` 不再加载 localStorage 中的旧 providers/runs。
+2. 登录检查完成并刷新 `/api/state` 后再展示服务端真实数据。
+3. 删除检测进度弹窗。
+4. 在模型监控页面顶部增加任务区：
+   - queued / running / completed / failed
+   - 当前 provider / agent / model
+   - completed / total
+   - success / failed
+   - stage / message / error
+5. 允许多个检测任务继续点击创建，后端排队执行。
+6. 每个 job 独立轮询，完成后刷新 state。
+
+## 后端修改
+
+1. 增加 `runtimeBaseUrlFor(provider, agent)`。
+2. `runOne()` 使用 runtimeBaseUrl 生成：
+   - proxyBaseUrl
+   - capture.upstreamBaseUrl
+   - 写入 CLI 配置的 base_url
+3. 保持 CLI 原始 endpoint 行为。
+
+## 文档更新
+
+README 增加：
+
+- Base URL 应填 API base，不是完整 endpoint。
+- Codex 最终请求 `/v1/responses`。
+- Claude Code 最终请求 `/v1/messages`。
+- OpenAI Chat Completions 是 `/v1/chat/completions`，但本项目默认不把 Codex 转成 chat completions。
+- 顶部任务进度区和多任务排队说明。
+
+## 验证
+
+本地：
+
+```bash
+npm run typecheck
+npm run build
+node --check server/index.mjs
+```
+
+Linux：
+
+```bash
+cd /root/model-detect
+git pull
+export PATH=/root/model-detect/.tools/node-v20.19.5-linux-arm64/bin:$PATH
+npm install
+npm run build
+fuser -k 20020/tcp || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+测试 provider：
+
+```text
+anyrouter
+muyuan公益站
+muyuan
+```
+
+只用短 prompt，查看成功/失败日志，不扩大测试范围。

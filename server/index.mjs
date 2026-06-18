@@ -401,6 +401,26 @@ function proxyBaseUrlFor(port, upstreamBaseUrl) {
   return `http://127.0.0.1:${port}${path}`
 }
 
+function runtimeBaseUrlFor(provider, agent) {
+  const raw = String(provider.baseUrl || '').trim()
+  if (!raw) return raw
+  const url = new URL(raw)
+  const path = url.pathname.replace(/\/+$/, '')
+  const lower = path.toLowerCase()
+  const endpointPattern = /\/(v\d+\/)?(responses|chat\/completions|messages|completions)$/
+  const gatewayPrefixes = ['/compat', '/openai-compatible', '/openai-compat', '/litellm', '/proxy', '/gateway']
+  if (!path || path === '/') {
+    url.pathname = '/v1'
+  } else if (/\/v\d+$/.test(lower) || endpointPattern.test(lower)) {
+    url.pathname = path
+  } else if (gatewayPrefixes.some((prefix) => lower.endsWith(prefix))) {
+    url.pathname = path
+  } else if (agent === 'claude' || agent === 'codex') {
+    url.pathname = `${path}/v1`
+  }
+  return url.toString().replace(/\/$/, '')
+}
+
 function normalizeHeaders(headers) {
   return Object.fromEntries(
     Object.entries(headers).map(([key, value]) => [
@@ -593,9 +613,11 @@ async function runChecks(target = {}, scheduled = false, job = null) {
 
 async function runOne(state, provider, model) {
   const proxyPort = Number(state.settings.proxyPort || 7788)
-  const proxyBaseUrl = proxyBaseUrlFor(proxyPort, provider.baseUrl)
+  const runtimeBaseUrl = runtimeBaseUrlFor(provider, model.agent)
+  const runtimeProvider = { ...provider, baseUrl: runtimeBaseUrl }
+  const proxyBaseUrl = proxyBaseUrlFor(proxyPort, runtimeBaseUrl)
   await startCaptureProxy(proxyPort)
-  await materializeProvider(provider, model, proxyBaseUrl)
+  await materializeProvider(runtimeProvider, model, proxyBaseUrl)
   const started = Date.now()
   const prompt = model.prompt || provider.prompt || state.settings.prompt || 'Hello'
   const base = providerBase(provider)
@@ -604,7 +626,7 @@ async function runOne(state, provider, model) {
     providerId: provider.id,
     agent: model.agent,
     model: model.name,
-    upstreamBaseUrl: provider.baseUrl,
+    upstreamBaseUrl: runtimeBaseUrl,
     proxyBaseUrl,
     proxyUrl: provider.proxyUrl || '',
     saveBody: provider.saveBody,
@@ -623,7 +645,7 @@ async function runOne(state, provider, model) {
     if (model.agent === 'codex') {
       const codexHome = join(base, 'codex-home')
       const [cmd, ...prefix] = commandParts(state.settings.codexCommand || 'codex')
-      const envName = envKeyFromCodexConfig(buildCodexConfig(provider, model, proxyBaseUrl))
+      const envName = envKeyFromCodexConfig(buildCodexConfig(runtimeProvider, model, proxyBaseUrl))
       if (envName && provider.apiKey) commonEnv[envName] = provider.apiKey
       result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--json', prompt], {
         cwd: root,
@@ -653,9 +675,9 @@ async function runOne(state, provider, model) {
   const latencyMs = Date.now() - started
   const exchange = selectExchange(capture.exchanges)
   const logDetail = exchange?.logDetail ?? {
-    client_headers: buildRequest(provider, model, prompt).headers,
-    client_body: buildRequest(provider, model, prompt).body,
-    forward_url: provider.baseUrl,
+    client_headers: buildRequest(runtimeProvider, model, prompt).headers,
+    client_body: buildRequest(runtimeProvider, model, prompt).body,
+    forward_url: runtimeBaseUrl,
     forward_headers: {},
     forward_body: provider.saveBody ? { model: model.name, prompt } : '[body disabled]',
     provider_headers: { 'x-cli-exit-code': String(result.exitCode ?? ''), 'x-cli-agent': model.agent },
@@ -682,7 +704,7 @@ async function runOne(state, provider, model) {
     stdout: result.stdout,
     stderr: result.stderr,
     errorMessage,
-    request: exchange?.request ?? buildRequest(provider, model, prompt),
+    request: exchange?.request ?? buildRequest(runtimeProvider, model, prompt),
     response: exchange?.response ?? {
       headers: { 'x-cli-exit-code': String(result.exitCode ?? ''), 'x-cli-agent': model.agent },
       body: provider.saveBody ? { stdout: result.stdout, stderr: result.stderr, note: 'no proxy exchange captured' } : '[body disabled]'

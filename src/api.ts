@@ -2,6 +2,10 @@ import type { AppState, CheckJob, CheckTarget, GlobalSettings, ProviderConfig } 
 import { loadState as loadLocalState } from './mockApi'
 
 export const loadInitialState = () => loadLocalState()
+export const loadShellState = () => {
+  const state = loadLocalState()
+  return { ...state, providers: [], runs: [] }
+}
 
 export class ApiError extends Error {
   status: number
