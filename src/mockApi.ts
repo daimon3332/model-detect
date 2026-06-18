@@ -83,7 +83,7 @@ export function createProviderDraft(): ProviderConfig {
     codexEnabled: true,
     claudeEnabled: false,
     prompt: '',
-    timeoutSeconds: 90,
+    timeoutSeconds: 20,
     scheduleEnabled: false,
     saveBody: true,
     models: [],

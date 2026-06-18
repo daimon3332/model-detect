@@ -49,6 +49,11 @@ export async function deleteProviderApi(state: AppState, providerId: string) {
   assignState(state, next)
 }
 
+export async function clearRunsApi(state: AppState, target: CheckTarget = {}) {
+  const next = await api<AppState>('/api/runs/clear', { method: 'POST', body: target })
+  assignState(state, next)
+}
+
 export async function saveSettingsApi(state: AppState, extra: Partial<GlobalSettings> = {}) {
   const next = await api<AppState>('/api/settings', { method: 'POST', body: { ...state.settings, ...extra } })
   assignState(state, next)

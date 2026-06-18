@@ -183,7 +183,7 @@ function normalizeProvider(provider) {
     codexEnabled: provider.codexEnabled !== false,
     claudeEnabled: provider.claudeEnabled === true,
     prompt: provider.prompt || '',
-    timeoutSeconds: Number(provider.timeoutSeconds || 90),
+    timeoutSeconds: Number(provider.timeoutSeconds || 20),
     scheduleEnabled: provider.scheduleEnabled === true,
     saveBody: provider.saveBody !== false,
     models: Array.isArray(provider.models)
@@ -223,6 +223,57 @@ async function deleteProvider(id) {
     state.runs = state.runs.filter((item) => item.providerId !== id)
     return state
   })
+}
+
+async function clearRuns(target = {}) {
+  return updateState((state) => {
+    const providerId = target.providerId || ''
+    const agent = target.agent || ''
+    const modelName = target.modelName || ''
+    if (!providerId) {
+      state.runs = []
+      state.providers.forEach(resetProviderRuns)
+      return state
+    }
+
+    state.runs = state.runs.filter((run) => {
+      if (run.providerId !== providerId) return true
+      if (!agent || !modelName) return false
+      return !(run.agent === agent && run.model === modelName)
+    })
+
+    const provider = state.providers.find((item) => item.id === providerId)
+    if (!provider) return state
+    if (!agent || !modelName) {
+      resetProviderRuns(provider)
+      return state
+    }
+
+    const model = provider.models.find((item) => item.agent === agent && item.name === modelName)
+    if (model) {
+      model.lastRunAt = ''
+      model.nextRunAt = ''
+    }
+    const latestProviderRun = latestRun(state.runs, providerId)
+    provider.lastRunAt = latestProviderRun?.createdAt || ''
+    if (!latestProviderRun) provider.nextRunAt = ''
+    return state
+  })
+}
+
+function resetProviderRuns(provider) {
+  provider.lastRunAt = ''
+  provider.nextRunAt = ''
+  provider.models.forEach((model) => {
+    model.lastRunAt = ''
+    model.nextRunAt = ''
+  })
+}
+
+function latestRun(runs, providerId) {
+  return runs
+    .filter((run) => run.providerId === providerId)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
 }
 
 async function materializeProvider(provider, model, proxyBaseUrl = '', base = providerBase(provider)) {
@@ -715,7 +766,7 @@ async function runOne(state, provider, model) {
   const prompt = model.prompt || provider.prompt || state.settings.prompt || 'Hello'
   const base = providerBase(provider)
   const runBase = join(base, 'run-contexts', safeId(runId))
-  const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 90)) * 1000
+  const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 20)) * 1000
   const capture = {
     providerId: provider.id,
     agent: model.agent,
@@ -912,6 +963,7 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs)
   if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req))))
+  if (req.method === 'POST' && pathname === '/api/runs/clear') return send(res, 200, publicState(await clearRuns(await readJson(req))))
   if (req.method === 'POST' && pathname === '/api/settings') {
     const body = await readJson(req)
     if (body.adminPassword === '') delete body.adminPassword

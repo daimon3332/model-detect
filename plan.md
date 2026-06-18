@@ -2,149 +2,117 @@
 
 ## 本轮目标
 
-实现并发检测，但每个检测 run 使用独立本地代理端口和独立 capture context，避免请求日志串线；同时修复 DeepSeek Claude Code 路径补全、增强顶部任务进度、让单模型完成后立即保存并刷新。
+1. 将模型提供商默认超时时间从 `90` 秒改为 `20` 秒。
+2. 新增清空检测记录功能，支持三个层级：
+   - 全部检测记录
+   - 指定模型提供商的检测记录
+   - 指定模型提供商 + 指定 agent + 指定模型的检测记录
+3. 前端在模型监控页和日志记录页提供清空入口。
+4. 更新 README，说明默认超时和清空检测记录规则。
+5. 本地验证后提交、推送，并同步部署到 Linux `/root/model-detect`。
 
-## 当前问题
+## 设计细节
 
-1. 旧设计使用全局 `activeProxyContext` 和共享 `127.0.0.1:7788`，只能串行，否则多个 CLI 请求会串日志。
-2. 当前 job 只显示任务总进度，不显示每个 provider/model 的独立结果。
-3. 当前 runs 基本等任务结束后批量写入，不利于首页最近 10 次逐步更新。
-4. DeepSeek 官方 Claude Code 文档要求 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`，不能自动补成 `/anthropic/v1`，否则 Claude Code 追加 `/v1/messages` 后会变成错误路径。
-5. 当前超时默认 90 秒，前端已有 provider 级设置，但文案不够清楚；最大并发数还没有全局设置。
+### 1. 默认超时改为 20 秒
 
-## 设计
+后端：
 
-### 1. 每个 run 独立代理
+```js
+normalizeProvider(provider):
+  timeoutSeconds = Number(provider.timeoutSeconds || 20)
 
-移除：
-
-```text
-全局 127.0.0.1:7788
-全局 activeProxyContext
-全局串行 checkQueue
+runOne(...):
+  timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 20)) * 1000
 ```
 
-改为：
-
-```text
-runOne()
-  -> createCaptureProxy(capture)
-  -> 监听 127.0.0.1:0，由系统分配动态端口
-  -> proxy handler 闭包绑定 capture
-  -> CLI base_url 指向该 run 的独立代理端口
-  -> runOne finally 关闭代理
-```
-
-这样多个 CLI 可以并发执行，每个请求只进入自己的 proxy/context。
-
-同时每个 run 会创建临时 CLI 上下文目录：
-
-```text
-data/providers/<provider-id>/run-contexts/<run-id>/codex-home/config.toml
-data/providers/<provider-id>/run-contexts/<run-id>/claude-workspace/.claude/settings.json
-```
-
-CLI 进程只读取本 run 的临时配置，避免同一个 provider 下多个模型并发时互相覆盖 `model`、`base_url` 或 Claude Code settings。run 结束后删除临时上下文目录，保留 provider 的持久配置目录和检测日志。
-
-### 2. 并发池
-
-保留队列概念，但改为 worker pool：
-
-```text
-queued items -> runWithConcurrency(maxConcurrentChecks)
-```
-
-默认：
-
-```text
-settings.maxConcurrentChecks = 3
-```
-
-限制范围：
-
-```text
-1 - 10
-```
-
-### 3. job.items
-
-CheckJob 增加：
+前端新建 provider 默认值同步改为：
 
 ```ts
-items: Array<{
-  id: string
-  providerId: string
-  providerName: string
-  agent: AgentType
-  model: string
-  status: 'queued' | 'running' | 'success' | 'failed' | 'timeout'
-  httpStatus: number | null
-  cliExitCode: number | null
-  latencyMs: number
-  errorMessage: string
-  runId: string
-}>
+timeoutSeconds: 20
 ```
 
-顶部任务区显示任务级和模型级：
+Provider 编辑弹窗仍保留 `5 - 600` 秒范围。
+
+### 2. 清空检测记录 API
+
+新增后端接口：
+
+```http
+POST /api/runs/clear
+```
+
+请求体：
+
+```ts
+{
+  providerId?: string
+  agent?: 'codex' | 'claude'
+  modelName?: string
+}
+```
+
+清空规则：
 
 ```text
-检测全部 running 2/5
-✅ anyrouter / codex / gpt5.5       404 failed
-⏳ muyuan公益站 / codex / gpt-5.5   running
-❌ muyuan / codex / gpt-5.5         timeout
+无 providerId
+  -> 清空全部 runs
+
+providerId only
+  -> 清空该 provider 下全部 runs
+
+providerId + agent + modelName
+  -> 清空该 provider 下指定 agent/model 的 runs
 ```
 
-### 4. 单模型完成即保存
-
-流程：
+为了避免页面显示旧状态，清空后同步维护运行时间字段：
 
 ```text
-runOne 完成
-  -> 立即 updateState 写入该 run
-  -> 更新 job.items 对应项
-  -> 更新 completed/success/failed
-  -> 前端轮询发现 completed 变化后 refreshState()
+清空全部：
+  provider.lastRunAt = ''
+  provider.nextRunAt = ''
+  model.lastRunAt = ''
+  model.nextRunAt = ''
+
+清空 provider：
+  当前 provider.lastRunAt = ''
+  当前 provider.nextRunAt = ''
+  当前 provider 所有 model lastRunAt/nextRunAt = ''
+
+清空单模型：
+  当前 model lastRunAt/nextRunAt = ''
+  当前 provider.lastRunAt 根据剩余 runs 重新计算
 ```
 
-这样首页最近 10 次会逐步更新，不等整个 job 完成。
+### 3. 前端 API
 
-### 5. Base URL 修正
+新增：
 
-Codex：
-
-```text
-用户填 https://host        -> 运行时 https://host/v1 -> CLI 请求 /v1/responses
-用户填 https://host/v1     -> 保持 -> CLI 请求 /v1/responses
+```ts
+clearRunsApi(state, target)
 ```
 
-Claude Code：
+调用 `/api/runs/clear`，返回新的 `AppState` 后 `assignState`。
 
-```text
-用户填 https://api.deepseek.com/anthropic -> 保持 -> CLI 请求 /anthropic/v1/messages
-用户填 https://api.anthropic.com          -> 保持 -> CLI 请求 /v1/messages
-```
+### 4. 前端入口
 
-也就是 Claude 不自动给自定义 path 补 `/v1`。
+模型监控页：
 
-### 6. 前端
+- 顶部增加 `清空全部记录`。
+- provider 卡片增加 `清空该提供商记录`。
+- 每个模型行增加 `清空记录`。
 
-1. 顶部任务区显示 job.items。
-2. 多个任务可以继续点击创建，互不阻塞。
-3. 轮询 job 时，如果 `completed` 增加，立即 `refreshState()`。
-4. 全局设置新增最大并发数。
-5. Provider 编辑中的 `CLI 超时` 文案改为 `CLI / 上游请求超时（秒）`。
+日志记录页：
 
-### 7. README
+- 增加 `清空全部记录`。
 
-更新：
+所有清空动作都先弹确认框，确认后调用 API 并刷新 state。
 
-- 默认最大并发 3。
-- 每个检测 run 使用独立本地代理端口。
-- 每个检测 run 使用独立临时 CLI 配置目录，避免并发模型串配置。
-- 单模型完成立即写日志。
-- Claude Code / DeepSeek Base URL 不自动补 `/v1`。
-- 超时设置位置和含义。
+### 5. 文档
+
+更新 README：
+
+- 默认超时：`20s`。
+- 清空检测记录支持全部 / provider / provider+agent+model 三层级。
 
 ## 验证
 
@@ -166,9 +134,5 @@ npm install
 npm run build
 fuser -k 20020/tcp || true
 PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+curl -s -D - http://127.0.0.1:20020/api/session
 ```
-
-短 prompt 验证：
-
-- DeepSeek / Claude Code，重点确认转发 URL 是 `https://api.deepseek.com/anthropic/v1/messages`。
-- 必要时再抽测 anyrouter / muyuan公益站 / muyuan，避免大量 token 消耗。

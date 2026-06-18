@@ -40,6 +40,7 @@ import {
 import {
   ApiError,
   checkSessionApi,
+  clearRunsApi,
   deleteProviderApi,
   getCheckJobApi,
   loadShellState,
@@ -50,7 +51,7 @@ import {
   saveSettingsApi,
   startChecksApi
 } from './api'
-import type { AgentType, AppState, CheckJob, ProviderConfig, RunState, TestRun } from './types'
+import type { AgentType, AppState, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun } from './types'
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
@@ -233,6 +234,24 @@ const deleteProvider = async (provider: ProviderConfig) => {
     ElMessage.success('已删除')
   } catch (error) {
     handleApiError(error, '删除提供商失败')
+  }
+}
+
+const clearRunRecords = async (target: CheckTarget = {}, label = '全部检测记录') => {
+  await ElMessageBox.confirm(`确认清空${label}？`, '清空检测记录', {
+    type: 'warning',
+    confirmButtonText: '清空',
+    cancelButtonText: '取消'
+  })
+  try {
+    await clearRunsApi(state, target)
+    if (activeRun.value && !state.runs.some((run) => run.id === activeRun.value?.id)) {
+      runDrawer.value = false
+      activeRun.value = null
+    }
+    ElMessage.success('已清空')
+  } catch (error) {
+    handleApiError(error, '清空检测记录失败')
   }
 }
 
@@ -520,6 +539,9 @@ onMounted(boot)
                 <el-option label="超时" value="timeout" />
               </el-select>
               <el-button :icon="VideoPlay" type="primary" @click="runChecks()">检测全部</el-button>
+              <el-button :icon="Delete" type="danger" plain :disabled="!state.runs.length" @click="clearRunRecords()">
+                清空全部记录
+              </el-button>
             </div>
           </div>
 
@@ -570,6 +592,16 @@ onMounted(boot)
                   <el-tag v-if="provider.codexEnabled" effect="plain">Codex</el-tag>
                   <el-tag v-if="provider.claudeEnabled" effect="plain" type="success">Claude Code</el-tag>
                   <el-button size="small" :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
+                  <el-button
+                    size="small"
+                    :icon="Delete"
+                    type="danger"
+                    plain
+                    :disabled="!state.runs.some((run) => run.providerId === provider.id)"
+                    @click.stop="clearRunRecords({ providerId: provider.id }, `${provider.name} 的检测记录`)"
+                  >
+                    清空
+                  </el-button>
                 </div>
               </div>
 
@@ -583,7 +615,22 @@ onMounted(boot)
                 <div v-for="model in providerModels(provider)" :key="model.id" class="table-row">
                   <span class="mono">{{ model.name }}</span>
                   <el-tag effect="plain" round>{{ agentLabel(model.agent) }}</el-tag>
-                  <el-button size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
+                  <div class="row-actions">
+                    <el-button size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
+                    <el-button
+                      size="small"
+                      :icon="Delete"
+                      type="danger"
+                      plain
+                      :disabled="!recentRuns(state, provider.id, model.name, model.agent).length"
+                      @click="clearRunRecords(
+                        { providerId: provider.id, agent: model.agent, modelName: model.name },
+                        `${provider.name} / ${agentLabel(model.agent)} / ${model.name} 的检测记录`
+                      )"
+                    >
+                      清空
+                    </el-button>
+                  </div>
                   <div class="run-strip">
                     <button
                       v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
@@ -687,6 +734,9 @@ onMounted(boot)
         <el-card shadow="never" class="glass-card">
           <div class="toolbar-only">
             <el-button :icon="Refresh" @click="manualRefresh">刷新</el-button>
+            <el-button :icon="Delete" type="danger" plain :disabled="!state.runs.length" @click="clearRunRecords()">
+              清空全部记录
+            </el-button>
           </div>
 
           <el-empty v-if="!latestLogs.length" description="暂无日志记录" />
