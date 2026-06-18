@@ -397,3 +397,13 @@ npm run typecheck
 npm run build
 node --check server/index.mjs
 ```
+
+## 本轮 README 更新
+
+1. 在 Linux 已有仓库更新部署部分补充每次更新后的标准步骤：
+   - `git pull`
+   - `npm install`
+   - `npm run build`
+   - 重启 `PORT=20020` 后台服务
+2. 明确说明：只要不确定是否有后端改动，更新后都建议重启后台服务。
+3. 说明纯前端改动理论上构建后即可读取新的 `dist/`，但生产环境仍建议重启，避免旧进程、缓存或状态不同步。

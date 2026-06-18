@@ -117,7 +117,7 @@ http://服务器IP:20020
 
 ### 已有仓库更新部署
 
-当前推荐用 git 直接更新：
+每次项目更新后，推荐按下面顺序执行：
 
 ```bash
 cd /root/model-detect
@@ -127,6 +127,26 @@ npm run build
 fuser -k 20020/tcp || true
 PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
+
+说明：
+
+```text
+git pull       拉取最新代码
+npm install    依赖有变化时安装；没变化也可以执行，通常很快
+npm run build  重新构建前端 dist
+重启后台服务   推荐每次更新后都重启
+```
+
+必须重启后台服务的情况：
+
+```text
+server/index.mjs 改了
+package.json / package-lock.json 改了
+后端 API、定时任务、检测逻辑、备份逻辑改了
+不确定这次更新有没有后端改动
+```
+
+只有纯前端改动时，`npm run build` 后理论上 Node 会读取新的 `dist/` 文件，但生产环境仍建议重启一次，避免旧进程、浏览器缓存或反代缓存造成状态不同步。
 
 `data/` 是本地运行数据目录，已加入 `.gitignore`，`git pull` 不会覆盖 provider 配置、管理员密码和检测日志。
 
