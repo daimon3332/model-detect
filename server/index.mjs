@@ -5,6 +5,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { ProxyAgent } from 'proxy-agent'
 
@@ -15,6 +16,7 @@ const runsFile = join(dataDir, 'runs.json')
 const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
 const maxCapturedBodyChars = 2_000_000
+const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
 
 const defaultCodexConfig = `model_reasoning_summary = "none"
 model_reasoning_effort = "low"
@@ -87,6 +89,7 @@ const defaults = {
     redactLogs: true,
     defaultCodexConfig,
     defaultClaudeSettings,
+    codexInstruction: defaultCodexInstruction,
     adminPassword: 'admin'
   }
 }
@@ -177,8 +180,14 @@ function normalizeSettings(settings = {}) {
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
   merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
+  merged.codexInstruction = normalizeTextFileContent(settings.codexInstruction, defaultCodexInstruction)
   merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
+}
+
+function normalizeTextFileContent(value, fallback) {
+  const text = value === undefined || value === null ? fallback : String(value)
+  return text.endsWith('\n') ? text : `${text}\n`
 }
 
 function normalizeDefaultCodexConfig(value) {
@@ -654,6 +663,21 @@ function buildCodexConfig(provider, model, proxyBaseUrl = '') {
       : `${text.trim()}\nbase_url = "${proxyBaseUrl}"`
   }
   return text.trim() + '\n'
+}
+
+function hasCodexInstructionFile(text) {
+  return /model_instructions_file\s*=/m.test(text || '')
+}
+
+function isCodexInstructionMissing(result) {
+  const message = `${result?.stdout || ''}\n${result?.stderr || ''}`
+  return /failed to read model instructions file/i.test(message) && /instruction\.md/i.test(message)
+}
+
+async function ensureCodexInstructionFile(settings) {
+  const dir = join(homedir(), '.codex')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'instruction.md'), normalizeTextFileContent(settings.codexInstruction, defaultCodexInstruction), 'utf8')
 }
 
 function ensureTomlSetting(text, key, value) {
@@ -1162,13 +1186,23 @@ async function runOne(state, provider, model) {
       const codexWorkspace = join(runBase, 'codex-workspace')
       await mkdir(codexWorkspace, { recursive: true })
       const [cmd, ...prefix] = commandParts(state.settings.codexCommand || 'codex')
-      const envName = envKeyFromCodexConfig(buildCodexConfig(runtimeProvider, model, proxyBaseUrl))
+      const codexConfig = buildCodexConfig(runtimeProvider, model, proxyBaseUrl)
+      if (hasCodexInstructionFile(codexConfig)) await ensureCodexInstructionFile(state.settings)
+      const envName = envKeyFromCodexConfig(codexConfig)
       if (envName && provider.apiKey) commonEnv[envName] = provider.apiKey
       result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--ephemeral', '--json', prompt], {
         cwd: codexWorkspace,
         env: { ...commonEnv, CODEX_HOME: codexHome },
         timeoutMs
       })
+      if (isCodexInstructionMissing(result)) {
+        await ensureCodexInstructionFile(state.settings)
+        result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--ephemeral', '--json', prompt], {
+          cwd: codexWorkspace,
+          env: { ...commonEnv, CODEX_HOME: codexHome },
+          timeoutMs
+        })
+      }
     } else {
       const workspace = join(runBase, 'claude-workspace')
       const settingsPath = join(workspace, '.claude', 'settings.json')
@@ -1386,6 +1420,7 @@ async function handleApi(req, res, pathname) {
       current.settings = normalizeSettings({ ...current.settings, ...body })
       return current
     })
+    if (hasCodexInstructionFile(state.settings.defaultCodexConfig)) await ensureCodexInstructionFile(state.settings)
     return send(res, 200, publicState(state, { includeRuns: false }))
   }
   if (req.method === 'POST' && pathname === '/api/checks') {

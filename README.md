@@ -1049,6 +1049,26 @@ base_url = "https://example.com/v1"
 wire_api = "responses"
 ```
 
+`Codex instruction.md` 默认内容：
+
+```text
+You are Codex, a coding agent based on GPT-5.
+```
+
+如果 `config.toml` 中存在：
+
+```toml
+model_instructions_file = "~/.codex/instruction.md"
+```
+
+后端会自动确保服务器当前运行用户的文件存在：
+
+```text
+~/.codex/instruction.md
+```
+
+写入内容来自“全局设置 -> Codex instruction.md”。如果 Codex 仍返回 `failed to read model instructions file`，后端会自动写入该文件并重试一次。本逻辑只在 Codex config 仍包含 `model_instructions_file` 时生效；如果不想使用，直接从全局默认模板或 provider 的 `.codex/config.toml` 删除该行即可。
+
 全局默认模板不保存 `env_key`。真实检测时，后端会为临时 run 的 Codex 配置自动补：
 
 ```toml
@@ -1236,6 +1256,9 @@ hello
 - 数据目录。
 - 日志保留天数。
 - 日志脱敏。
+- Codex 默认 `config.toml`。
+- Codex `instruction.md`。
+- Claude Code 默认 `settings.json`。
 - 导出备份。
 - 导入备份。
 - 修改管理员密码。

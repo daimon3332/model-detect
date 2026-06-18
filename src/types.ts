@@ -49,6 +49,7 @@ export interface GlobalSettings {
   redactLogs: boolean
   defaultCodexConfig: string
   defaultClaudeSettings: string
+  codexInstruction: string
   adminPassword?: string
 }
 

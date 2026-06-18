@@ -1023,6 +1023,9 @@ onMounted(boot)
             <el-form-item label="Codex 默认 config.toml">
               <el-input v-model="state.settings.defaultCodexConfig" type="textarea" :rows="14" class="code-input" />
             </el-form-item>
+            <el-form-item label="Codex instruction.md">
+              <el-input v-model="state.settings.codexInstruction" type="textarea" :rows="5" class="code-input" />
+            </el-form-item>
             <el-form-item label="Claude Code 默认 settings.json">
               <el-input v-model="state.settings.defaultClaudeSettings" type="textarea" :rows="12" class="code-input" />
             </el-form-item>

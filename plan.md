@@ -1,5 +1,80 @@
 # Plan
 
+## 当前任务：Codex instruction.md 自动创建
+
+### 问题
+
+`config.toml` 中保留了：
+
+```toml
+model_instructions_file = "~/.codex/instruction.md"
+```
+
+在 `121.37.47.90` 上通过页面运行 Codex 时，Codex CLI 会读取：
+
+```text
+/root/.codex/instruction.md
+```
+
+该文件不存在时，Codex 在请求模型前退出：
+
+```text
+Error: failed to read model instructions file /root/.codex/instruction.md: No such file or directory
+```
+
+### 实施
+
+1. 新增全局设置字段：
+
+```ts
+settings.codexInstruction
+```
+
+默认内容：
+
+```text
+You are Codex, a coding agent based on GPT-5.
+```
+
+2. 全局设置页面新增 `Codex instruction.md` 编辑区。
+3. 后端在以下场景自动写入：
+
+```text
+~/.codex/instruction.md
+```
+
+   - 保存全局设置时，如果默认 Codex config 中仍包含 `model_instructions_file`。
+   - Codex 检测前，如果当前 run 的 Codex config 中包含 `model_instructions_file`。
+   - 如果 Codex 仍报 instruction 文件缺失错误，则自动写入后重试一次。
+
+4. 如果用户不想使用该文件，只需要从 provider 的 `config.toml` 或全局默认 `config.toml` 删除：
+
+```toml
+model_instructions_file = "~/.codex/instruction.md"
+```
+
+5. 更新 README。
+6. 验证：
+
+```bash
+npm run typecheck
+npm run build
+node --check server/index.mjs
+```
+
+当前本地验证结果：
+
+```text
+npm run typecheck               通过
+npm run build                   通过
+node --check server/index.mjs   通过
+```
+
+7. 提交、push，同步 `121.37.47.90` 并重启 `PORT=20020`。
+8. 只触发一次 Codex 单模型检测，验证不再出现 instruction 文件缺失错误。
+
+---
+
 ## 当前任务：全局设置页面布局修复
 
 ### 问题

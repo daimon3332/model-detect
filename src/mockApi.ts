@@ -1,6 +1,7 @@
 import type { AgentType, AppState, GlobalSettings, ProviderConfig, ProviderModel, RunState, TestRun } from './types'
 
 const key = 'model-detect-state-v2'
+const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
 
 const defaultSettings: GlobalSettings = {
   codexCommand: 'codex',
@@ -18,7 +19,8 @@ const defaultSettings: GlobalSettings = {
   logRetentionDays: 30,
   redactLogs: true,
   defaultCodexConfig: '',
-  defaultClaudeSettings: ''
+  defaultClaudeSettings: '',
+  codexInstruction: defaultCodexInstruction
 }
 
 const defaultCodexConfig = `model_reasoning_summary = "none"
@@ -91,7 +93,13 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
   merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_summary', '"none"')
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
+  merged.codexInstruction = normalizeTextFileContent(settings?.codexInstruction, defaultCodexInstruction)
   return merged
+}
+
+function normalizeTextFileContent(value: unknown, fallback: string) {
+  const text = value === undefined || value === null ? fallback : String(value)
+  return text.endsWith('\n') ? text : `${text}\n`
 }
 
 function ensureTomlSetting(text: string, key: string, value: string) {
