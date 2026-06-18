@@ -1,5 +1,39 @@
 # Plan
 
+## 当前任务：全局设置页面布局修复
+
+### 问题
+
+全局设置页面的配置卡片宽度固定偏窄并靠左显示，顶部操作按钮较多时容易在页面左侧被裁切，用户在页面上看不到完整的左侧按钮。
+
+### 实施
+
+1. 修改 `src/styles.css`：
+   - `.settings-card` 从 `max-width: 760px` 改为 `width: min(1280px, 100%)`。
+   - `.settings-card` 增加 `margin: 6px auto 0`，让全局设置内容在工作区中居中。
+   - `.settings-card .toolbar-only` 增加 `flex-wrap: wrap` 和 `justify-content: flex-start`，让导出、导入、重置、保存按钮从左到右排列并在空间不足时换行。
+   - `.settings-card .el-card__body` 增加内边距，提升宽布局下的可读性。
+2. 更新 `README.md`：
+   - 说明全局设置页使用居中宽卡片布局。
+   - 说明顶部按钮支持自动换行，避免裁切。
+3. 验证：
+
+```bash
+npm run typecheck
+npm run build
+```
+
+当前验证结果：
+
+```text
+npm run typecheck  通过
+npm run build      通过
+```
+
+4. 提交、push，并同步 Linux `/root/model-detect`，构建后重启 `PORT=20020` 服务。
+
+---
+
 ## 当前任务：默认 CLI 配置模板与重置功能
 
 ### 用户要求

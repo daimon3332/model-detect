@@ -464,7 +464,17 @@ pre,
 }
 
 .settings-card {
-  max-width: 760px;
+  width: min(1280px, 100%);
+  margin: 6px auto 0;
+}
+
+.settings-card .toolbar-only {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.settings-card .el-card__body {
+  padding: 24px 30px;
 }
 
 .prompt-card {
