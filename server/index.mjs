@@ -310,7 +310,14 @@ async function proxyRequest(req, res) {
   delete outboundHeaders.connection
   delete outboundHeaders['content-length']
 
-  const upstream = await requestUpstream(targetUrl, req.method, outboundHeaders, ['GET', 'HEAD'].includes(req.method) ? undefined : requestBodyBuffer, context.proxyUrl)
+  const upstream = await requestUpstream(
+    targetUrl,
+    req.method,
+    outboundHeaders,
+    ['GET', 'HEAD'].includes(req.method) ? undefined : requestBodyBuffer,
+    context.proxyUrl,
+    context.timeoutMs
+  )
 
   const responseHeaders = normalizeHeaders(upstream.headers)
   for (const [key, value] of Object.entries(responseHeaders)) {
@@ -361,23 +368,39 @@ async function proxyRequest(req, res) {
   })
 }
 
-function requestUpstream(targetUrl, method, headers, body, proxyUrl = '') {
+function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeoutMs = 90_000) {
   const target = new URL(targetUrl)
   const client = target.protocol === 'https:' ? httpsRequest : httpRequest
   const agent = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
     const upstreamReq = client(target, { method, headers, agent }, (upstreamRes) => {
       const chunks = []
       upstreamRes.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
       upstreamRes.on('end', () => {
-        resolve({
+        finish({
           statusCode: upstreamRes.statusCode || 502,
           headers: upstreamRes.headers,
           body: Buffer.concat(chunks)
         })
       })
     })
-    upstreamReq.on('error', reject)
+    upstreamReq.setTimeout(Math.max(1000, Number(timeoutMs || 90_000)), () => {
+      upstreamReq.destroy(new Error('upstream_timeout'))
+    })
+    upstreamReq.on('error', (error) => {
+      const timedOut = error.message === 'upstream_timeout'
+      finish({
+        statusCode: timedOut ? 504 : 502,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'x-model-detect-proxy-error': error.message },
+        body: Buffer.from(JSON.stringify({ error: error.message, type: timedOut ? 'upstream_timeout' : 'upstream_error' }))
+      })
+    })
     if (body) upstreamReq.write(body)
     upstreamReq.end()
   })
@@ -630,6 +653,7 @@ async function runOne(state, provider, model) {
     proxyBaseUrl,
     proxyUrl: provider.proxyUrl || '',
     saveBody: provider.saveBody,
+    timeoutMs: Math.max(1000, timeoutMs - 3000),
     exchanges: []
   }
   const commonEnv = {
