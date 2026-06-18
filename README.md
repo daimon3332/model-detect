@@ -130,6 +130,61 @@ PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 
 `data/` 是本地运行数据目录，已加入 `.gitignore`，`git pull` 不会覆盖 provider 配置、管理员密码和检测日志。
 
+### 迁移到另一台服务器
+
+新服务器必须先准备好前置条件：
+
+```text
+Node.js 20+
+npm
+codex
+claude
+```
+
+#### 方式一：整目录迁移
+
+如果想连 provider 配置、API Key、管理员密码、检测日志一起迁移，可以复制整个目录：
+
+```bash
+scp -r /root/model-detect root@新服务器:/root/model-detect
+```
+
+到新服务器后删除旧运行文件，再重新构建和启动：
+
+```bash
+cd /root/model-detect
+rm -f server.pid server.log
+npm install
+npm run build
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+#### 方式二：干净部署，只迁移数据
+
+推荐先 clone 新代码，再只复制旧服务器的 `data/`：
+
+```bash
+git clone https://github.com/daimon3332/model-detect.git /root/model-detect
+scp -r root@旧服务器:/root/model-detect/data /root/model-detect/data
+cd /root/model-detect
+npm install
+npm run build
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+```
+
+`data/` 包含：
+
+```text
+state.json
+providers/
+管理员密码
+模型提供商配置
+API Key
+检测日志
+```
+
+如果不复制 `data/`，新服务器就是全新实例，默认管理员密码会恢复为 `admin`。
+
 ### 停止后台服务
 
 优先使用 pid 文件：
