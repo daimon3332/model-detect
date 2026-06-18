@@ -49,6 +49,11 @@ export async function deleteProviderApi(state: AppState, providerId: string) {
   assignState(state, next)
 }
 
+export async function resetProviderConfigApi(state: AppState, body: { providerId?: string; target: AgentType }) {
+  const next = await api<AppState>('/api/providers/reset-config', { method: 'POST', body })
+  assignState(state, next)
+}
+
 export async function clearRunsApi(state: AppState, target: CheckTarget = {}) {
   const next = await api<AppState>('/api/runs/clear', { method: 'POST', body: target })
   assignState(state, next)

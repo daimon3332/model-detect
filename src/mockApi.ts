@@ -21,20 +21,19 @@ const defaultSettings: GlobalSettings = {
   defaultClaudeSettings: ''
 }
 
-const defaultCodexConfig = `model = "gpt-5.5"
+const defaultCodexConfig = `model_reasoning_summary = "none"
+model_reasoning_effort = "low"
+model_verbosity = "low"
+model = "gpt-5.5"
 model_provider = "provider"
 approval_policy = "never"
 sandbox_mode = "read-only"
-model_verbosity = "low"
-model_reasoning_effort = "low"
-model_reasoning_summary = "none"
 model_instructions_file = "~/.codex/instruction.md"
 
 [model_providers.provider]
 name = "Provider"
 base_url = "https://example.com/v1"
 wire_api = "responses"
-env_key = "OPENAI_API_KEY"
 `
 
 const defaultClaudeSettings = `{

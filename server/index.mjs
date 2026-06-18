@@ -16,7 +16,22 @@ const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
 const maxCapturedBodyChars = 2_000_000
 
-const defaultCodexConfig = `model = "gpt-5.5"
+const defaultCodexConfig = `model_reasoning_summary = "none"
+model_reasoning_effort = "low"
+model_verbosity = "low"
+model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+`
+
+const legacyDefaultCodexConfig = `model = "gpt-5.5"
 model_provider = "provider"
 approval_policy = "never"
 sandbox_mode = "read-only"
@@ -160,12 +175,26 @@ function normalizeSettings(settings = {}) {
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
   merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
-  merged.defaultCodexConfig = ensureTomlSetting(String(merged.defaultCodexConfig || defaultCodexConfig), 'model_verbosity', '"low"')
-  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
-  merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_summary', '"none"')
+  merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   merged.adminPassword = String(merged.adminPassword || 'admin')
   return merged
+}
+
+function normalizeDefaultCodexConfig(value) {
+  let text = String(value || defaultCodexConfig)
+  if (sameTomlLines(text, legacyDefaultCodexConfig)) text = defaultCodexConfig
+  text = ensureTomlSetting(text, 'model_verbosity', '"low"')
+  text = ensureTomlSetting(text, 'model_reasoning_effort', '"low"')
+  text = ensureTomlSetting(text, 'model_reasoning_summary', '"none"')
+  return text.trim() + '\n'
+}
+
+function sameTomlLines(left, right) {
+  const normalize = (value) => String(value).trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const leftLines = normalize(left)
+  const rightLines = normalize(right)
+  return leftLines.length === rightLines.length && leftLines.every((line, index) => line === rightLines[index])
 }
 
 function scheduleIntervalMs(settings) {
@@ -342,6 +371,20 @@ async function deleteProvider(id) {
     return current
   })
   return { ...state, runs: nextRuns }
+}
+
+async function resetProviderConfig(body = {}) {
+  const target = String(body.target || '')
+  const providerId = String(body.providerId || '')
+  return updateState(async (state) => {
+    const providers = state.providers.filter((provider) => !providerId || provider.id === providerId)
+    for (const provider of providers) {
+      if (target === 'codex') provider.codexConfig = state.settings.defaultCodexConfig
+      if (target === 'claude') provider.claudeSettings = state.settings.defaultClaudeSettings
+      await materializeProvider(provider)
+    }
+    return state
+  })
 }
 
 async function clearRuns(target = {}) {
@@ -1316,6 +1359,11 @@ async function handleApi(req, res, pathname) {
     const run = runs.find((item) => item.id === runMatch[1])
     if (!run) return send(res, 404, { error: 'run_not_found' })
     return send(res, 200, run)
+  }
+  if (req.method === 'POST' && pathname === '/api/providers/reset-config') {
+    const body = await readJson(req)
+    if (!['codex', 'claude'].includes(body.target)) return send(res, 400, { error: 'invalid_target' })
+    return send(res, 200, publicState(await resetProviderConfig(body), { includeRuns: false }))
   }
   if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req)), { includeRuns: false }))
   if (req.method === 'POST' && pathname === '/api/runs/clear') return send(res, 200, publicState(await clearRuns(await readJson(req))))

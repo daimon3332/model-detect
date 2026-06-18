@@ -51,6 +51,7 @@ import {
   loginApi,
   logoutApi,
   refreshState,
+  resetProviderConfigApi,
   saveModelScheduleApi,
   saveProviderScheduleApi,
   saveProviderApi,
@@ -443,6 +444,29 @@ const saveSettings = async () => {
   } catch (error) {
     handleApiError(error, '保存设置失败')
   }
+}
+
+const resetAllProviderConfig = async (target: AgentType) => {
+  const label = target === 'codex' ? 'Codex config.toml' : 'Claude settings.json'
+  try {
+    await ElMessageBox.confirm(`确认将所有提供商的 ${label} 重置为当前已保存的全局默认配置？`, `重置所有 ${label}`, {
+      type: 'warning',
+      confirmButtonText: '重置',
+      cancelButtonText: '取消'
+    })
+    await resetProviderConfigApi(state, { target })
+    ElMessage.success(`已重置所有 ${label}`)
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    handleApiError(error, `重置 ${label} 失败`)
+  }
+}
+
+const resetActiveProviderConfigDraft = (target: AgentType) => {
+  if (!activeProvider.value) return
+  if (target === 'codex') activeProvider.value.codexConfig = state.settings.defaultCodexConfig
+  else activeProvider.value.claudeSettings = state.settings.defaultClaudeSettings
+  ElMessage.success('已替换为全局默认配置，点击保存后生效')
 }
 
 const saveTaskProvider = async (provider: ProviderConfig) => {
@@ -972,6 +996,8 @@ onMounted(boot)
           <div class="toolbar-only">
             <el-button @click="exportBackup">导出备份</el-button>
             <el-button @click="triggerBackupImport">导入备份</el-button>
+            <el-button @click="resetAllProviderConfig('codex')">重置所有 Codex config.toml</el-button>
+            <el-button @click="resetAllProviderConfig('claude')">重置所有 Claude settings.json</el-button>
             <el-button type="primary" @click="saveSettings">保存</el-button>
             <input ref="backupFileInput" type="file" accept="application/json" class="hidden-file-input" @change="importBackupFile" />
           </div>
@@ -1086,9 +1112,15 @@ onMounted(boot)
             </div>
           </el-tab-pane>
           <el-tab-pane label=".codex/config.toml">
+            <div class="model-config-toolbar">
+              <el-button @click="resetActiveProviderConfigDraft('codex')">重置 Codex config.toml</el-button>
+            </div>
             <el-input v-model="activeProvider.codexConfig" type="textarea" :rows="16" class="code-input" />
           </el-tab-pane>
           <el-tab-pane label=".claude/settings.json">
+            <div class="model-config-toolbar">
+              <el-button @click="resetActiveProviderConfigDraft('claude')">重置 Claude settings.json</el-button>
+            </div>
             <el-input v-model="activeProvider.claudeSettings" type="textarea" :rows="16" class="code-input" />
           </el-tab-pane>
         </el-tabs>

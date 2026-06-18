@@ -1,5 +1,134 @@
 # Plan
 
+## 当前任务：默认 CLI 配置模板与重置功能
+
+### 用户要求
+
+1. 全局默认 Codex `config.toml` 必须按指定内容保存，不在全局默认模板里写 `env_key`：
+
+```toml
+model_reasoning_summary = "none"
+model_reasoning_effort = "low"
+model_verbosity = "low"
+model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+```
+
+2. Codex 运行时仍由 `buildCodexConfig()` 自动补 `env_key = "OPENAI_API_KEY"`，用于把 provider 的 API Key 注入给真实 Codex CLI。
+3. 新增后端统一重置接口：
+
+```http
+POST /api/providers/reset-config
+```
+
+请求体：
+
+```json
+{
+  "providerId": "可选，不传表示全部 provider",
+  "target": "codex 或 claude"
+}
+```
+
+4. 重置逻辑：
+
+```text
+target = codex  -> provider.codexConfig = state.settings.defaultCodexConfig
+target = claude -> provider.claudeSettings = state.settings.defaultClaudeSettings
+providerId 为空 -> 重置全部 provider
+providerId 存在 -> 只重置指定 provider
+每个变更后的 provider 调用 materializeProvider(provider)
+返回 publicState
+```
+
+5. 重置不修改：
+
+```text
+API Key
+Base URL
+模型列表
+prompt
+定时任务
+检测记录
+管理员密码
+```
+
+6. 全局设置页面新增：
+   - 重置所有 Codex config.toml
+   - 重置所有 Claude settings.json
+7. 单个提供商编辑弹窗中，在对应配置编辑区上方新增：
+   - 重置 Codex config.toml
+   - 重置 Claude settings.json
+8. README 增加完整默认 Codex `config.toml`、重置功能说明和更新部署说明。
+9. 完成验证、提交、push，并同步 Linux `/root/model-detect`，构建后重启 `PORT=20020` 服务。
+
+### 实施步骤
+
+1. 修改 `server/index.mjs`：
+   - 调整 `defaultCodexConfig` 为用户指定内容和顺序。
+   - 保留 `buildCodexConfig()` 运行时自动补 `env_key` 的逻辑。
+   - 新增 `resetProviderConfig()`。
+   - 在 `handleApi()` 增加 `POST /api/providers/reset-config`。
+2. 修改 `src/mockApi.ts`：
+   - 调整前端 mock 默认 Codex 模板，与后端保持一致。
+3. 修改 `src/api.ts`：
+   - 新增 `resetProviderConfigApi()`。
+4. 修改 `src/App.vue`：
+   - 引入 `resetProviderConfigApi()`。
+   - 新增全局重置按钮和确认框。
+   - 新增 provider 弹窗内局部重置按钮。
+   - 局部重置只修改当前弹窗 draft，点击保存后才写入 provider。
+5. 修改 `README.md`：
+   - 补全默认 Codex 模板。
+   - 说明全局重置和单 provider 重置的行为边界。
+   - 保留并强调 `git pull -> npm install -> npm run build -> 重启后台`。
+6. 验证：
+
+```bash
+npm run typecheck
+npm run build
+node --check server/index.mjs
+```
+
+当前本地验证结果：
+
+```text
+npm run typecheck               通过
+npm run build                   通过
+node --check server/index.mjs   通过
+```
+
+7. Git：
+
+```bash
+git status --short
+git add .
+git commit -m "Add provider config reset controls"
+git push
+```
+
+8. Linux 同步：
+
+```bash
+cd /root/model-detect
+git pull --ff-only
+npm install
+npm run build
+fuser -k 20020/tcp || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+curl http://127.0.0.1:20020/api/session
+```
+
+---
+
 ## 本轮目标
 
 1. 修复“定时任务”页面开关点击后先滑回、再滑过去的问题。
@@ -407,3 +536,4 @@ node --check server/index.mjs
    - 重启 `PORT=20020` 后台服务
 2. 明确说明：只要不确定是否有后端改动，更新后都建议重启后台服务。
 3. 说明纯前端改动理论上构建后即可读取新的 `dist/`，但生产环境仍建议重启，避免旧进程、缓存或状态不同步。
+

@@ -681,12 +681,22 @@ codex exec --skip-git-repo-check --ephemeral --json "Reply exactly: ok"
 Reply exactly: ok
 ```
 
-默认 Codex `config.toml` 包含：
+默认 Codex `config.toml`：
 
 ```toml
-model_verbosity = "low"
-model_reasoning_effort = "low"
 model_reasoning_summary = "none"
+model_reasoning_effort = "low"
+model_verbosity = "low"
+model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
+model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
 ```
 
 说明：
@@ -696,6 +706,8 @@ model_verbosity = "low"       控制 GPT-5 系列最终输出长度
 model_reasoning_effort = "low" 降低 reasoning token 消耗
 model_reasoning_summary = "none" 不生成 reasoning summary
 ```
+
+全局默认模板不写 `env_key`。真实运行时 `buildCodexConfig()` 会在临时 run 配置中自动补 `env_key = "OPENAI_API_KEY"`，并通过环境变量把当前 provider 的 API Key 注入给 Codex CLI。
 
 `--ephemeral` 用于避免持久化本次 Codex session 文件。空临时 workspace 用于减少项目说明、AGENTS.md、仓库上下文等额外输入 token；同时仍保留真实 Codex CLI 调用、本地代理抓包和 provider 隔离配置。
 
@@ -991,14 +1003,59 @@ Claude Code 默认 settings.json
 
 新建 provider 时会使用这两个模板，已有 provider 不会被自动覆盖。
 
-Codex 默认模板包含：
+如果需要把已有 provider 的配置重新套用当前全局默认模板，可以使用：
+
+```text
+全局设置 -> 重置所有 Codex config.toml
+全局设置 -> 重置所有 Claude settings.json
+模型提供商 -> 编辑 -> 对应配置页 -> 重置 Codex config.toml
+模型提供商 -> 编辑 -> 对应配置页 -> 重置 Claude settings.json
+```
+
+全局重置会立即写入所有 provider 并重建对应配置目录；单 provider 编辑弹窗里的重置只修改当前弹窗内容，需要点击“保存”后才写入该 provider。
+
+重置不会修改 API Key、Base URL、模型列表、prompt、定时任务、检测记录或管理员密码。
+
+后端接口：
+
+```http
+POST /api/providers/reset-config
+```
+
+请求体：
+
+```json
+{
+  "providerId": "可选，不传表示全部",
+  "target": "codex 或 claude"
+}
+```
+
+Codex 默认模板完整内容：
 
 ```toml
-model_verbosity = "low"
-model_reasoning_effort = "low"
 model_reasoning_summary = "none"
+model_reasoning_effort = "low"
+model_verbosity = "low"
+model = "gpt-5.5"
+model_provider = "provider"
+approval_policy = "never"
+sandbox_mode = "read-only"
 model_instructions_file = "~/.codex/instruction.md"
+
+[model_providers.provider]
+name = "Provider"
+base_url = "https://example.com/v1"
+wire_api = "responses"
 ```
+
+全局默认模板不保存 `env_key`。真实检测时，后端会为临时 run 的 Codex 配置自动补：
+
+```toml
+env_key = "OPENAI_API_KEY"
+```
+
+这样可以保持全局默认模板简洁，同时仍能把当前 provider 的 API Key 注入给真实 Codex CLI。
 
 Claude Code 默认模板包含低输出检测相关环境变量：
 
