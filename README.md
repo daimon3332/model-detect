@@ -26,12 +26,21 @@ Node.js 建议使用 `^20.19.0` 或 `>=22.12.0`，因为当前项目使用 Vite 
 | ufw | 可选 | Linux 开放端口时使用 |
 | Nginx / Caddy | 可选 | 需要域名、HTTPS、反代时使用 |
 
-不需要提前配置用户级 Codex / Claude Code。项目会为每个模型提供商创建独立目录：
+不需要提前配置用户级 Codex / Claude Code。项目会为每个模型提供商创建独立持久配置目录：
 
 ```text
 data/providers/<provider-id>/codex-home/config.toml
 data/providers/<provider-id>/claude-workspace/.claude/settings.json
 ```
+
+真实检测时还会为每个 run 创建临时 CLI 上下文目录：
+
+```text
+data/providers/<provider-id>/run-contexts/<run-id>/codex-home/config.toml
+data/providers/<provider-id>/run-contexts/<run-id>/claude-workspace/.claude/settings.json
+```
+
+这样同一 provider 下多个模型并发检测时，不会互相覆盖 `model`、`base_url` 或 Claude Code settings。run 结束后临时目录会自动删除，持久 provider 配置和检测日志会保留。
 
 ## 启动方式
 
@@ -684,7 +693,9 @@ API 失败 -> 前端直接提示错误
   -> job 完成后刷新 /api/state
 ```
 
-每个检测 run 会启动一个独立的本地抓包代理端口，并由该代理闭包绑定自己的 capture context。多个 CLI 可以并发执行，不再共享全局 `activeProxyContext`，不会串请求日志。前端不会阻止你继续点击其他 provider/model 检测，新任务会进入并发池并在顶部任务区展示。
+每个检测 run 会启动一个独立的本地抓包代理端口，并由该代理闭包绑定自己的 capture context。多个 CLI 可以并发执行，不再共享全局 `activeProxyContext`，不会串请求日志。
+
+每个检测 run 也会创建独立临时 CLI 配置目录，避免同 provider 多模型并发时串 `model` 或串 `base_url`。前端不会阻止你继续点击其他 provider/model 检测，新任务会进入并发池并在顶部任务区展示。
 
 `state.json` 写入使用串行队列。检测结束时只合并新增 runs 和 lastRunAt，不会用检测开始时的旧 provider 列表覆盖最新配置。
 

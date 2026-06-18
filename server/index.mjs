@@ -225,8 +225,7 @@ async function deleteProvider(id) {
   })
 }
 
-async function materializeProvider(provider, model, proxyBaseUrl = '') {
-  const base = providerBase(provider)
+async function materializeProvider(provider, model, proxyBaseUrl = '', base = providerBase(provider)) {
   const codexHome = join(base, 'codex-home')
   const claudeWorkspace = join(base, 'claude-workspace')
   await mkdir(codexHome, { recursive: true })
@@ -709,18 +708,20 @@ async function saveRun(run, scheduled = false) {
 }
 
 async function runOne(state, provider, model) {
+  const runId = randomUUID()
   const runtimeBaseUrl = runtimeBaseUrlFor(provider, model.agent)
   const runtimeProvider = { ...provider, baseUrl: runtimeBaseUrl }
   const started = Date.now()
   const prompt = model.prompt || provider.prompt || state.settings.prompt || 'Hello'
   const base = providerBase(provider)
+  const runBase = join(base, 'run-contexts', safeId(runId))
   const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 90)) * 1000
   const capture = {
     providerId: provider.id,
     agent: model.agent,
     model: model.name,
     upstreamBaseUrl: runtimeBaseUrl,
-    proxyBaseUrl,
+    proxyBaseUrl: '',
     proxyUrl: provider.proxyUrl || '',
     saveBody: provider.saveBody,
     timeoutMs: Math.max(1000, timeoutMs - 3000),
@@ -729,7 +730,7 @@ async function runOne(state, provider, model) {
   const proxy = await createCaptureProxy(capture)
   const proxyBaseUrl = proxyBaseUrlFor(proxy.port, runtimeBaseUrl)
   capture.proxyBaseUrl = proxyBaseUrl
-  await materializeProvider(runtimeProvider, model, proxyBaseUrl)
+  await materializeProvider(runtimeProvider, model, proxyBaseUrl, runBase)
   const commonEnv = {
     ...process.env,
     OPENAI_API_KEY: provider.apiKey || process.env.OPENAI_API_KEY,
@@ -740,7 +741,7 @@ async function runOne(state, provider, model) {
   let result
   try {
     if (model.agent === 'codex') {
-      const codexHome = join(base, 'codex-home')
+      const codexHome = join(runBase, 'codex-home')
       const [cmd, ...prefix] = commandParts(state.settings.codexCommand || 'codex')
       const envName = envKeyFromCodexConfig(buildCodexConfig(runtimeProvider, model, proxyBaseUrl))
       if (envName && provider.apiKey) commonEnv[envName] = provider.apiKey
@@ -750,7 +751,7 @@ async function runOne(state, provider, model) {
         timeoutMs
       })
     } else {
-      const workspace = join(base, 'claude-workspace')
+      const workspace = join(runBase, 'claude-workspace')
       const [cmd, ...prefix] = commandParts(state.settings.claudeCommand || 'claude')
       result = await execProcess(cmd, [...prefix, '-p', prompt], {
         cwd: workspace,
@@ -767,6 +768,7 @@ async function runOne(state, provider, model) {
     }
   } finally {
     await proxy.close()
+    await rm(runBase, { recursive: true, force: true })
   }
 
   const latencyMs = Date.now() - started
@@ -787,7 +789,7 @@ async function runOne(state, provider, model) {
   const errorMessage = ok ? '' : timedOut ? 'CLI process timed out' : result.stderr.trim() || 'No valid text output'
 
   return {
-    id: crypto.randomUUID(),
+    id: runId,
     providerId: provider.id,
     providerName: provider.name,
     model: model.name,

@@ -37,6 +37,15 @@ runOne()
 
 这样多个 CLI 可以并发执行，每个请求只进入自己的 proxy/context。
 
+同时每个 run 会创建临时 CLI 上下文目录：
+
+```text
+data/providers/<provider-id>/run-contexts/<run-id>/codex-home/config.toml
+data/providers/<provider-id>/run-contexts/<run-id>/claude-workspace/.claude/settings.json
+```
+
+CLI 进程只读取本 run 的临时配置，避免同一个 provider 下多个模型并发时互相覆盖 `model`、`base_url` 或 Claude Code settings。run 结束后删除临时上下文目录，保留 provider 的持久配置目录和检测日志。
+
 ### 2. 并发池
 
 保留队列概念，但改为 worker pool：
@@ -132,6 +141,7 @@ Claude Code：
 
 - 默认最大并发 3。
 - 每个检测 run 使用独立本地代理端口。
+- 每个检测 run 使用独立临时 CLI 配置目录，避免并发模型串配置。
 - 单模型完成立即写日志。
 - Claude Code / DeepSeek Base URL 不自动补 `/v1`。
 - 超时设置位置和含义。
