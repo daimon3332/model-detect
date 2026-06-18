@@ -73,6 +73,37 @@ node --check server/index.mjs   通过
 7. 提交、push，同步 `121.37.47.90` 并重启 `PORT=20020`。
 8. 只触发一次 Codex 单模型检测，验证不再出现 instruction 文件缺失错误。
 
+### 服务器验证结果
+
+部署目标：
+
+```text
+121.37.47.90:/root/model-detect
+```
+
+验证目标：
+
+```text
+鲨鱼辣椒 / codex / gpt-5.5
+```
+
+验证结果：
+
+```text
+runId: 4d460165-aea1-429a-8408-7a9c70b86c39
+state: success
+httpStatus: 200
+cliExitCode: 0
+instructionExists: true
+instructionContent: You are Codex, a coding agent based on GPT-5.
+```
+
+Codex 不再出现：
+
+```text
+failed to read model instructions file /root/.codex/instruction.md
+```
+
 ---
 
 ## 当前任务：全局设置页面布局修复
