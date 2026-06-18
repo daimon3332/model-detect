@@ -42,13 +42,18 @@ import {
   checkSessionApi,
   clearRunsApi,
   deleteProviderApi,
+  exportBackupApi,
   getCheckJobApi,
   getRunApi,
+  importBackupApi,
   loadShellState,
   loginApi,
   logoutApi,
   refreshState,
+  saveModelScheduleApi,
+  saveProviderScheduleApi,
   saveProviderApi,
+  saveScheduleSettingsApi,
   saveSettingsApi,
   startChecksApi
 } from './api'
@@ -69,7 +74,7 @@ JsonTree = defineComponent({
     level: { type: Number, default: 0 }
   },
   setup(props) {
-    const open = ref(props.level < 1)
+    const open = ref(true)
     return () => {
       const value = props.data
       const collapsible = isRecord(value)
@@ -131,6 +136,8 @@ const loginLoading = ref(false)
 const newAdminPassword = ref('')
 const confirmAdminPassword = ref('')
 const activeJobs = ref<CheckJob[]>([])
+const backupFileInput = ref<HTMLInputElement | null>(null)
+const scheduleSaving = reactive<Record<string, boolean>>({})
 
 const filters = reactive({
   providerId: 'all',
@@ -350,7 +357,7 @@ const syncActiveProviderModels = () => {
 const detailPreview = (value: unknown) => {
   const safeValue = detailDisplayValue(value)
   if (typeof safeValue === 'string') return safeValue.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\r\n/g, '\n')
-  return JSON.stringify(safeValue, null, 2)
+  return JSON.stringify(safeValue, null, 2) ?? String(safeValue ?? '')
 }
 
 const detailDisplayValue = (value: unknown) => {
@@ -374,6 +381,37 @@ const detailMeta = (value: unknown) => {
   if (length < 1000000) return `${(length / 1000).toFixed(1)}K 字符`
   return `${(length / 1000000).toFixed(1)}M 字符`
 }
+
+const copyText = async (text: string) => {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const input = document.createElement('textarea')
+  input.value = text
+  input.style.position = 'fixed'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+  input.select()
+  document.execCommand('copy')
+  document.body.removeChild(input)
+}
+
+const copyDetailContent = async () => {
+  if (!activeRun.value) return
+  try {
+    await copyText(detailPreview(detailContent(activeRun.value)))
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.error('复制失败')
+  }
+}
+
+const setScheduleSaving = (key: string, value: boolean) => {
+  scheduleSaving[key] = value
+}
+
+const isScheduleSaving = (key: string) => scheduleSaving[key] === true
 
 const saveSettings = async () => {
   const extra: Record<string, string> = {}
@@ -406,11 +444,87 @@ const saveTaskProvider = async (provider: ProviderConfig) => {
   }
 }
 
-const saveScheduleSettings = async () => {
+const saveScheduleSettings = async (rollback?: () => void) => {
+  const key = 'global'
+  setScheduleSaving(key, true)
   try {
-    await saveSettingsApi(state)
+    await saveScheduleSettingsApi(state, {
+      scheduleEnabled: state.settings.scheduleEnabled,
+      scheduleDays: state.settings.scheduleDays,
+      scheduleHours: state.settings.scheduleHours,
+      scheduleMinutes: state.settings.scheduleMinutes
+    })
   } catch (error) {
+    rollback?.()
     handleApiError(error, '保存定时任务失败')
+  } finally {
+    setScheduleSaving(key, false)
+  }
+}
+
+const saveProviderSchedule = async (provider: ProviderConfig, value: boolean) => {
+  const key = `provider:${provider.id}`
+  setScheduleSaving(key, true)
+  try {
+    await saveProviderScheduleApi(state, provider.id, value)
+  } catch (error) {
+    provider.scheduleEnabled = !value
+    handleApiError(error, '保存提供商定时任务失败')
+  } finally {
+    setScheduleSaving(key, false)
+  }
+}
+
+const saveModelSchedule = async (provider: ProviderConfig, model: ProviderConfig['models'][number], value: boolean) => {
+  const key = `model:${provider.id}:${model.agent}:${model.name}`
+  setScheduleSaving(key, true)
+  try {
+    await saveModelScheduleApi(state, provider.id, model.agent, model.name, value)
+  } catch (error) {
+    model.scheduleEnabled = !value
+    handleApiError(error, '保存模型定时任务失败')
+  } finally {
+    setScheduleSaving(key, false)
+  }
+}
+
+const exportBackup = async () => {
+  try {
+    const backup = await exportBackupApi()
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `model-detect-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    link.click()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success('已导出备份')
+  } catch (error) {
+    handleApiError(error, '导出备份失败')
+  }
+}
+
+const triggerBackupImport = () => {
+  backupFileInput.value?.click()
+}
+
+const importBackupFile = async (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  try {
+    await ElMessageBox.confirm('导入会覆盖当前提供商、全局设置和检测记录，确认继续？', '导入备份', {
+      type: 'warning',
+      confirmButtonText: '导入',
+      cancelButtonText: '取消'
+    })
+    const backup = JSON.parse(await file.text())
+    await importBackupApi(state, backup)
+    selectedProviderId.value = state.providers[0]?.id ?? ''
+    ElMessage.success('已导入备份')
+  } catch (error) {
+    if (error === 'cancel') return
+    handleApiError(error, '导入备份失败')
   }
 }
 
@@ -709,8 +823,11 @@ onMounted(boot)
         <el-card shadow="never" class="glass-card prompt-card">
           <div class="prompt-global">
             <el-form label-position="top">
-              <el-form-item label="全局 Prompt">
-                <el-input v-model="state.settings.prompt" type="textarea" :rows="3" placeholder="Hello" />
+              <el-form-item label="Codex 全局 Prompt">
+                <el-input v-model="state.settings.codexPrompt" type="textarea" :rows="3" placeholder="Hello" />
+              </el-form-item>
+              <el-form-item label="Claude Code 全局 Prompt">
+                <el-input v-model="state.settings.claudePrompt" type="textarea" :rows="3" placeholder="Reply exactly: ok" />
               </el-form-item>
             </el-form>
             <el-button type="primary" @click="saveSettings">保存全局 Prompt</el-button>
@@ -780,12 +897,17 @@ onMounted(boot)
       <section v-if="page === 'tasks'" class="page-grid">
         <el-card shadow="never" class="glass-card">
           <div class="task-global">
-            <el-switch v-model="state.settings.scheduleEnabled" active-text="总定时任务" @change="saveScheduleSettings" />
-            <el-input-number v-model="state.settings.scheduleDays" :min="0" :max="365" @change="saveScheduleSettings" />
+            <el-switch
+              v-model="state.settings.scheduleEnabled"
+              active-text="总定时任务"
+              :loading="isScheduleSaving('global')"
+              @change="(value) => saveScheduleSettings(() => { state.settings.scheduleEnabled = !Boolean(value) })"
+            />
+            <el-input-number v-model="state.settings.scheduleDays" :min="0" :max="365" @change="() => saveScheduleSettings()" />
             <span>天</span>
-            <el-input-number v-model="state.settings.scheduleHours" :min="0" :max="23" @change="saveScheduleSettings" />
+            <el-input-number v-model="state.settings.scheduleHours" :min="0" :max="23" @change="() => saveScheduleSettings()" />
             <span>小时</span>
-            <el-input-number v-model="state.settings.scheduleMinutes" :min="0" :max="59" @change="saveScheduleSettings" />
+            <el-input-number v-model="state.settings.scheduleMinutes" :min="0" :max="59" @change="() => saveScheduleSettings()" />
             <span>分钟</span>
           </div>
           <el-empty v-if="!state.providers.length" description="暂无模型提供商" />
@@ -793,13 +915,22 @@ onMounted(boot)
             <article v-for="provider in state.providers" :key="provider.id" class="task-card">
               <div class="task-provider-head">
                 <strong>{{ provider.name }}</strong>
-                <el-switch v-model="provider.scheduleEnabled" active-text="提供商" @change="saveTaskProvider(provider)" />
+                <el-switch
+                  v-model="provider.scheduleEnabled"
+                  active-text="提供商"
+                  :loading="isScheduleSaving(`provider:${provider.id}`)"
+                  @change="(value) => saveProviderSchedule(provider, Boolean(value))"
+                />
               </div>
               <div class="task-models">
                 <label v-for="model in provider.models" :key="model.id" class="task-model-row">
                   <span class="mono">{{ model.name }}</span>
                   <el-tag effect="plain" round>{{ agentLabel(model.agent) }}</el-tag>
-                  <el-switch v-model="model.scheduleEnabled" @change="saveTaskProvider(provider)" />
+                  <el-switch
+                    v-model="model.scheduleEnabled"
+                    :loading="isScheduleSaving(`model:${provider.id}:${model.agent}:${model.name}`)"
+                    @change="(value) => saveModelSchedule(provider, model, Boolean(value))"
+                  />
                 </label>
               </div>
             </article>
@@ -810,7 +941,10 @@ onMounted(boot)
       <section v-if="page === 'settings'" class="page-grid">
         <el-card shadow="never" class="glass-card settings-card">
           <div class="toolbar-only">
+            <el-button @click="exportBackup">导出备份</el-button>
+            <el-button @click="triggerBackupImport">导入备份</el-button>
             <el-button type="primary" @click="saveSettings">保存</el-button>
+            <input ref="backupFileInput" type="file" accept="application/json" class="hidden-file-input" @change="importBackupFile" />
           </div>
           <el-form label-position="top">
             <el-form-item label="Codex 命令">
@@ -934,7 +1068,10 @@ onMounted(boot)
             {{ item.label }}
           </el-button>
         </div>
-        <div class="detail-meta-line">{{ detailMeta(detailContent(activeRun)) }}</div>
+        <div class="detail-meta-line">
+          <span>{{ detailMeta(detailContent(activeRun)) }}</span>
+          <el-button size="small" @click="copyDetailContent">复制当前内容</el-button>
+        </div>
         <div v-if="isJsonTreeValue(detailContent(activeRun))" class="detail-json-tree">
           <JsonTree :data="detailDisplayValue(detailContent(activeRun))" />
         </div>

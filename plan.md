@@ -2,155 +2,229 @@
 
 ## 本轮目标
 
-1. 解决保存 provider/settings 和其他按钮响应慢的问题。
-2. 检测详情默认增加 `CLI 输入输出` 面板，展示 prompt/stdout/stderr/exit code。
-3. Codex 默认 `config.toml` 增加：
+1. 修复“定时任务”页面开关点击后先滑回、再滑过去的问题。
+2. 新添加的模型提供商和模型默认不开启定时任务。
+3. 增加备份导出 / 导入功能，方便迁移到其他服务器。
+4. 全局提示词拆分为 Codex Prompt 和 Claude Code Prompt。
+5. 优化 Claude Code 默认检测提示词和默认 settings，减少 Claude Code 检测回复长度和额外开销。
+6. 检测详情的 `CLI 输入输出 / 请求头 / 请求体 / 响应头 / 响应体 / 网关路由转发头 / 网关路由转发体` 增加一键复制。
+7. 检测详情 JSON 默认展开，不再默认折叠。
+8. 更新 README，补充定时任务、备份迁移、Claude Code 低输出检测、详情复制等说明。
+9. 完成 typecheck/build/server 语法验证，提交并推送。
 
-```toml
-model_instructions_file = "~/.codex/instruction.md"
+## 问题原因
+
+### 定时任务开关抖动
+
+当前定时任务页直接用：
+
+```vue
+<el-switch v-model="provider.scheduleEnabled" @change="saveTaskProvider(provider)" />
+<el-switch v-model="model.scheduleEnabled" @change="saveTaskProvider(provider)" />
 ```
 
-4. 在全局设置中增加 Codex 默认 `config.toml` 与 Claude Code 默认 `settings.json` 的编辑区域。
-5. 更新 README，说明性能优化、日志存储结构、详情加载方式和默认模板。
-6. 本地验证后提交、推送，并同步 Linux `/root/model-detect`。
-
-## 当前慢的原因
-
-现有设计把配置和日志全部放在一个 `data/state.json`：
+`saveTaskProvider(provider)` 会调用完整 provider 保存接口：
 
 ```text
-state.json = providers + settings + runs
+POST /api/providers
+  -> normalizeProvider
+  -> materializeProvider
+  -> 写 data/providers/<provider-id>/codex-home/config.toml
+  -> 写 data/providers/<provider-id>/claude-workspace/.claude/settings.json
+  -> 返回 state
 ```
 
-每条 run 又包含完整请求头、请求体、响应头、响应体、SSE、stdout、stderr 等内容。日志变多后：
+这条路径适合“编辑提供商配置”，但不适合定时任务开关。定时任务开关只需要改几个布尔值，却走了重路径；如果请求超时或被刷新状态覆盖，Element Plus switch 就会出现：
 
 ```text
-保存 provider/settings
-  -> 读取巨大 state.json
-  -> 重写巨大 state.json
-  -> 返回完整 publicState
-  -> 前端解析大量 runs 详情
+用户点击 -> v-model 本地切过去 -> API 超时/旧 state 覆盖 -> 滑回去 -> 后端稍后保存/刷新 -> 又滑过去
 ```
 
-所以配置保存、刷新和部分按钮都会变慢。
+Nginx 返回 `504 Gateway Time-out` 说明反代等后端响应超过超时时间，不是浏览器单纯网络慢。
 
-## 方案
+## 实施方案
 
-### 1. 配置与日志拆分
+### 1. 新增轻量定时任务 API
 
-改为：
+新增三个只更新定时任务字段的接口：
 
-```text
-data/state.json  // providers + settings
-data/runs.json   // 检测记录
+```http
+POST /api/schedule/settings
+POST /api/schedule/provider
+POST /api/schedule/model
 ```
 
-兼容旧数据：
-
-```text
-如果 runs.json 存在：runs 从 runs.json 读取
-如果 runs.json 不存在：从旧 state.json.runs 迁移读取
-保存 state 时不再写入完整 runs
-保存 run 时只写 runs.json
-```
-
-### 2. `/api/state` 返回轻量日志摘要
-
-新增摘要结构：
+它们只更新：
 
 ```ts
-RunSummary = {
-  id,
-  providerId,
-  providerName,
-  model,
-  agent,
-  state,
-  httpStatus,
-  cliExitCode,
-  latencyMs,
-  createdAt,
-  prompt,
-  errorMessage
+settings.scheduleEnabled
+settings.scheduleDays
+settings.scheduleHours
+settings.scheduleMinutes
+provider.scheduleEnabled
+model.scheduleEnabled
+```
+
+不重写 Codex / Claude Code 配置文件，不调用 `materializeProvider()`。
+
+### 2. 前端 switch 独立保存和失败回滚
+
+前端为每个开关维护独立 saving key：
+
+```ts
+scheduleSaving[key] = true
+try {
+  await saveScheduleXxxApi(...)
+} catch {
+  switchValue = previousValue
+}
+finally {
+  scheduleSaving[key] = false
 }
 ```
 
-`/api/state` 只返回摘要 runs，不返回完整请求体/响应体。这样保存 provider/settings 后的响应会很小。
+这样某个模型的定时任务开关保存中，不影响其他模型、其他提供商和其他页面操作。
 
-### 3. 新增完整 run 详情接口
+### 3. 默认关闭定时任务
+
+新增 provider：
+
+```ts
+scheduleEnabled: false
+```
+
+新增模型：
+
+```ts
+scheduleEnabled: false
+```
+
+后端 normalize 也改为只有显式 `true` 才开启，避免历史空值被当成开启。
+
+### 4. 备份导出 / 导入
 
 新增：
 
 ```http
-GET /api/runs/:id
+GET /api/backup/export
+POST /api/backup/import
 ```
 
-点击状态码或日志详情时再拉完整 run，并打开详情弹窗。
+导出结构：
 
-### 4. CLI 输入输出详情页
+```json
+{
+  "version": 1,
+  "exportedAt": "ISO time",
+  "state": {
+    "providers": [],
+    "settings": {}
+  },
+  "runs": []
+}
+```
 
-详情按钮顺序：
+导入采用覆盖模式：
+
+```text
+导入 providers/settings/runs
+重建 data/providers/<provider-id>/codex-home/config.toml
+重建 data/providers/<provider-id>/claude-workspace/.claude/settings.json
+```
+
+备份包含 API Key、管理员密码配置、检测日志和请求/响应内容，README 必须提示妥善保存。
+
+### 5. 全局 Prompt 拆分
+
+新增：
+
+```ts
+settings.codexPrompt
+settings.claudePrompt
+```
+
+保留旧字段：
+
+```ts
+settings.prompt
+```
+
+用于兼容旧数据。
+
+检测时优先级：
+
+```text
+model.prompt > provider.prompt > agent-specific global prompt > default
+```
+
+即：
+
+```ts
+const globalPrompt = model.agent === 'claude'
+  ? state.settings.claudePrompt
+  : state.settings.codexPrompt
+```
+
+默认值：
+
+```text
+Codex Prompt: Hello
+Claude Code Prompt: Reply exactly: ok
+```
+
+### 6. Claude Code 低输出 / 低开销默认配置
+
+根据官方文档：
+
+- `claude -p` 是 print mode。
+- `--bare` 会跳过 hooks、skills、plugins、MCP servers、auto memory、CLAUDE.md 自动发现，使脚本调用更快。
+- `--max-turns 1` 限制 agent turn。
+- `--no-session-persistence` 禁用会话持久化。
+- `--effort low` 降低 reasoning effort。
+- `MAX_THINKING_TOKENS=0` 可关闭或省略 thinking 参数。
+- `CLAUDE_CODE_EFFORT_LEVEL=low` 可设置低 effort。
+
+实现：
+
+```bash
+claude --bare --max-turns 1 --no-session-persistence --effort low --settings <run-settings.json> -p "Reply exactly: ok"
+```
+
+同时默认 Claude settings 模板增加：
+
+```json
+{
+  "env": {
+    "MAX_THINKING_TOKENS": "0",
+    "CLAUDE_CODE_EFFORT_LEVEL": "low",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1"
+  }
+}
+```
+
+### 7. 检测详情复制和 JSON 默认展开
+
+详情页按钮保持：
 
 ```text
 CLI 输入输出 | 请求头 | 请求体 | 响应头 | 响应体 | 网关路由转发头 | 网关路由转发体
 ```
 
-默认展示 `CLI 输入输出`。
+新增“复制当前内容”按钮。
 
-内容：
-
-```text
-Prompt:
-hello
-
-stdout:
-Hello! How can I help?
-
-stderr:
-...
-
-exit code:
-0
-```
-
-### 5. 默认模板
-
-新增全局设置字段：
+复制内容规则：
 
 ```ts
-settings.defaultCodexConfig
-settings.defaultClaudeSettings
+object/array -> JSON.stringify(value, null, 2)
+string       -> 原文本
+其他类型     -> String(value)
 ```
 
-默认 Codex TOML：
+JSON Tree 默认全部展开。
 
-```toml
-model = "gpt-5.5"
-model_provider = "provider"
-approval_policy = "never"
-sandbox_mode = "read-only"
-model_instructions_file = "~/.codex/instruction.md"
+## 验证
 
-[model_providers.provider]
-name = "Provider"
-base_url = "https://example.com/v1"
-wire_api = "responses"
-env_key = "OPENAI_API_KEY"
-```
-
-新建 provider 使用全局默认模板；已有 provider 不自动覆盖。
-
-### 6. 保存性能
-
-保存 provider/settings 后：
-
-- 后端只写 `state.json`。
-- 响应只返回 provider/settings + run 摘要。
-- 不再传输完整 run body。
-
-### 7. 验证
-
-本地：
+本地运行：
 
 ```bash
 npm run typecheck
@@ -158,15 +232,4 @@ npm run build
 node --check server/index.mjs
 ```
 
-Linux：
-
-```bash
-cd /root/model-detect
-git pull
-export PATH=/root/model-detect/.tools/node-v20.19.5-linux-arm64/bin:$PATH
-npm install
-npm run build
-fuser -k 20020/tcp || true
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
-curl -s -D - http://127.0.0.1:20020/api/session
-```
+通过后再提交和推送。

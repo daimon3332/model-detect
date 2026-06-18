@@ -186,6 +186,22 @@ API Key
 
 如果不复制 `data/`，新服务器就是全新实例，默认管理员密码会恢复为 `admin`。
 
+#### 方式三：页面备份迁移
+
+旧实例：
+
+```text
+全局设置 -> 导出备份
+```
+
+新实例：
+
+```text
+全局设置 -> 导入备份
+```
+
+导入会覆盖新实例当前的 provider、settings 和 runs，并重建 provider 配置目录。备份文件包含 API Key、管理员密码配置、请求头、请求体、响应头、响应体、stdout/stderr 等敏感内容，不要上传到公开仓库或发给无关人员。
+
 ### 停止后台服务
 
 优先使用 pid 文件：
@@ -305,6 +321,8 @@ settings.scheduleMinutes
 
 如果三项都为 0，后端按最小 1 分钟保护处理。所有被选中的 provider / model 使用同一个定时执行周期。
 
+新建 provider 和新建模型的定时任务默认都是关闭。定时任务页面的开关使用轻量 API 保存，只更新 schedule 字段，不重写 CLI 配置文件；如果保存失败，只回滚当前开关，不影响其他模型检测或其他开关。
+
 ## Prompt 规则
 
 Prompt 在“提示词”页面集中配置，也是三级优先级：
@@ -312,19 +330,22 @@ Prompt 在“提示词”页面集中配置，也是三级优先级：
 ```text
 model.prompt
   -> provider.prompt
-    -> settings.prompt
-      -> Hello
+    -> settings.codexPrompt / settings.claudePrompt
+      -> agent 默认 Prompt
 ```
 
-默认全局 Prompt 是：
+默认全局 Prompt 分为两类：
 
 ```text
-Hello
+Codex: Hello
+Claude Code: Reply exactly: ok
 ```
 
-provider prompt 为空时继承全局 prompt。
+provider prompt 为空时继承对应 agent 的全局 prompt。
 
-model prompt 为空时继承 provider prompt，再继承全局 prompt。
+model prompt 为空时继承 provider prompt，再继承对应 agent 的全局 prompt。
+
+Claude Code 默认使用更短的检测提示词，减少无意义回复长度。
 
 ### 后端
 
@@ -339,7 +360,7 @@ model prompt 为空时继承 provider prompt，再继承全局 prompt。
 
 ## 参考 CCG Gateway 的日志模板
 
-本项目的日志采集参考 `ccg-gateway` 的三段式结构。前端详情页按按钮展示六项：请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
+本项目的日志采集参考 `ccg-gateway` 的三段式结构。前端详情页按按钮展示七项：CLI 输入输出、请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
 
 内部仍然采集三段数据，便于后续排查：
 
@@ -352,6 +373,7 @@ provider = 服务商响应，也就是真实 provider 返回给代理的响应
 当前详情弹窗展示规则：
 
 ```text
+CLI 输入输出 = prompt + stdout + stderr + cliExitCode
 请求头 = client_headers
 请求体 = client_body
 响应头 = provider_headers
@@ -360,16 +382,17 @@ provider = 服务商响应，也就是真实 provider 返回给代理的响应
 网关路由转发体 = forward_body
 ```
 
-`forward_url` 和 `exchanges[]` 仍保存在日志数据中，用于后续高级诊断；当前详情页不再展示 `CLI`、`全部交换`、`原始 JSON` 入口。
+`forward_url` 和 `exchanges[]` 仍保存在日志数据中，用于后续高级诊断；当前详情页不再展示 `全部交换`、`原始 JSON` 入口。
 
 详情页展示策略：
 
 - 前端不再做 32K 字符截断，展示后端保存的完整字段内容。
 - 如果后端因为日志体积限制截断，会在内容中出现 `[truncated ... chars]`。
-- JSON object / array 使用可折叠树展示。
+- JSON object / array 使用可折叠树展示，并默认展开。
 - 合法 JSON 字符串会自动解析为可折叠树。
 - 普通字符串 body 按原始文本展示，不再用 `JSON.stringify` 包一层。
 - SSE / event-stream 响应按真实换行展示，避免全部挤成一行。
+- 当前按钮内容支持一键复制，object / array 会按格式化 JSON 复制。
 
 ### 1. Agent 请求
 
@@ -434,7 +457,7 @@ stdout
 stderr
 ```
 
-当前详情弹窗不展示 CLI tab；后续如果需要可在日志详情中增加高级模式。
+当前详情弹窗默认打开 `CLI 输入输出`，用于快速确认实际 prompt、stdout、stderr 和 exit code。
 
 ## 真实调用链路
 
@@ -578,7 +601,15 @@ data/providers/<provider-id>/claude-workspace/.claude/settings.json
 执行命令：
 
 ```bash
-claude -p "hello"
+claude --bare --max-turns 1 --no-session-persistence --effort low --settings <run-settings.json> -p "Reply exactly: ok"
+```
+
+`--bare` 用于脚本检测场景，跳过 hooks、skills、plugins、MCP servers、auto memory 和 CLAUDE.md 自动发现，减少启动开销。运行时还会设置：
+
+```text
+MAX_THINKING_TOKENS=0
+CLAUDE_CODE_EFFORT_LEVEL=low
+CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
 ```
 
 不会修改用户级 Claude Code 配置。
@@ -664,6 +695,57 @@ Proxy: socks5://127.0.0.1:7890
 ### `POST /api/settings`
 
 更新全局设置。
+
+### `POST /api/schedule/settings`
+
+轻量更新定时任务全局开关和执行间隔，不重写 provider CLI 配置目录。
+
+请求体：
+
+```json
+{
+  "scheduleEnabled": false,
+  "scheduleDays": 0,
+  "scheduleHours": 0,
+  "scheduleMinutes": 30
+}
+```
+
+### `POST /api/schedule/provider`
+
+轻量更新单个 provider 的定时任务开关。
+
+请求体：
+
+```json
+{
+  "providerId": "provider-id",
+  "scheduleEnabled": false
+}
+```
+
+### `POST /api/schedule/model`
+
+轻量更新单个模型的定时任务开关。
+
+请求体：
+
+```json
+{
+  "providerId": "provider-id",
+  "agent": "codex",
+  "modelName": "gpt-5.5",
+  "scheduleEnabled": false
+}
+```
+
+### `GET /api/backup/export`
+
+导出完整备份 JSON，包含 provider、settings 和 runs。备份中包含 API Key、管理员密码配置、请求体/响应体日志等敏感内容，只能自己保存。
+
+### `POST /api/backup/import`
+
+覆盖导入备份。导入后会重建 provider CLI 配置目录。
 
 ### `POST /api/checks`
 
@@ -826,6 +908,18 @@ Codex 默认模板包含：
 model_instructions_file = "~/.codex/instruction.md"
 ```
 
+Claude Code 默认模板包含低输出检测相关环境变量：
+
+```json
+{
+  "env": {
+    "MAX_THINKING_TOKENS": "0",
+    "CLAUDE_CODE_EFFORT_LEVEL": "low",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1"
+  }
+}
+```
+
 ## 日志数据结构
 
 单条 run 大致结构：
@@ -897,6 +991,8 @@ CLI 输入输出
 
 默认打开 `CLI 输入输出`，展示 prompt、stdout、stderr 和 cliExitCode。
 
+当前按钮内容都支持“复制当前内容”。JSON 内容默认展开，便于直接查看请求头、请求体、响应头、响应体和网关转发内容。
+
 `全部交换`、`原始 JSON` 不再作为详情页主入口展示。
 
 ## Linux 测试约束
@@ -965,9 +1061,10 @@ hello
 
 ### 提示词
 
-- 集中配置全局 Prompt、Provider Prompt、Model Prompt。
-- Provider Prompt 留空时继承全局 Prompt。
-- Model Prompt 留空时继承 Provider Prompt，再继承全局 Prompt。
+- 集中配置 Codex 全局 Prompt、Claude Code 全局 Prompt、Provider Prompt、Model Prompt。
+- Provider Prompt 留空时继承对应 agent 的全局 Prompt。
+- Model Prompt 留空时继承 Provider Prompt，再继承对应 agent 的全局 Prompt。
+- Codex 默认 `Hello`，Claude Code 默认 `Reply exactly: ok`。
 
 ### 定时任务
 
@@ -978,6 +1075,8 @@ hello
 - 总开关关闭时所有定时任务失效。
 - provider 关闭时该 provider 下所有 model 失效。
 - model 关闭时只影响该 model。
+- 新 provider 和新 model 默认不开启定时任务。
+- 开关保存使用轻量接口，不重写 CLI 配置文件。
 
 ### 全局设置
 
@@ -986,6 +1085,8 @@ hello
 - 数据目录。
 - 日志保留天数。
 - 日志脱敏。
+- 导出备份。
+- 导入备份。
 - 修改管理员密码。
 
 全局设置不再包含：

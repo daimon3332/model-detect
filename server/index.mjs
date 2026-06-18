@@ -33,7 +33,10 @@ const defaultClaudeSettings = `{
   "env": {
     "ANTHROPIC_BASE_URL": "https://example.com/anthropic",
     "ANTHROPIC_AUTH_TOKEN": "",
-    "ANTHROPIC_MODEL": ""
+    "ANTHROPIC_MODEL": "",
+    "MAX_THINKING_TOKENS": "0",
+    "CLAUDE_CODE_EFFORT_LEVEL": "low",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1"
   }
 }
 `
@@ -53,6 +56,8 @@ const defaults = {
     claudeCommand: 'claude',
     dataDir: './data',
     prompt: 'Hello',
+    codexPrompt: 'Hello',
+    claudePrompt: 'Reply exactly: ok',
     scheduleEnabled: false,
     scheduleDays: 0,
     scheduleHours: 0,
@@ -130,6 +135,12 @@ async function loadRuns(fallbackState = null) {
 
 function normalizeSettings(settings = {}) {
   const merged = { ...defaults.settings, ...settings }
+  const legacyPrompt = String(settings.prompt || '').trim()
+  merged.codexPrompt = String(settings.codexPrompt || legacyPrompt || defaults.settings.codexPrompt)
+  merged.claudePrompt = String(
+    settings.claudePrompt || (legacyPrompt && legacyPrompt.toLowerCase() !== 'hello' ? legacyPrompt : defaults.settings.claudePrompt)
+  )
+  merged.prompt = String(settings.prompt || merged.codexPrompt || defaults.settings.prompt)
   if (settings.scheduleDays === undefined && settings.scheduleHours === undefined) {
     const total = Math.max(0, Number(settings.scheduleMinutes || defaults.settings.scheduleMinutes))
     merged.scheduleDays = Math.floor(total / 1440)
@@ -285,7 +296,7 @@ function normalizeProvider(provider) {
           agent: item.agent,
           enabled: item.enabled !== false,
           prompt: item.prompt || '',
-          scheduleEnabled: item.scheduleEnabled !== false,
+          scheduleEnabled: item.scheduleEnabled === true,
           lastRunAt: item.lastRunAt || '',
           nextRunAt: item.nextRunAt || ''
         })).filter((item) => item.name && ['codex', 'claude'].includes(item.agent))
@@ -363,6 +374,100 @@ async function clearRuns(target = {}) {
   return { ...state, runs: nextRuns }
 }
 
+async function updateScheduleSettings(body = {}) {
+  return updateState((state) => {
+    state.settings = normalizeSettings({
+      ...state.settings,
+      scheduleEnabled: body.scheduleEnabled === true,
+      scheduleDays: Number(body.scheduleDays || 0),
+      scheduleHours: Number(body.scheduleHours || 0),
+      scheduleMinutes: Number(body.scheduleMinutes || 0)
+    })
+    if (!state.settings.scheduleEnabled) {
+      state.providers.forEach((provider) => {
+        provider.nextRunAt = ''
+        provider.models.forEach((model) => {
+          model.nextRunAt = ''
+        })
+      })
+    }
+    return state
+  })
+}
+
+async function updateProviderSchedule(body = {}) {
+  const providerId = String(body.providerId || '')
+  const enabled = body.scheduleEnabled === true
+  return updateState((state) => {
+    const provider = state.providers.find((item) => item.id === providerId)
+    if (!provider) return state
+    provider.scheduleEnabled = enabled
+    if (!enabled) {
+      provider.nextRunAt = ''
+      provider.models.forEach((model) => {
+        model.nextRunAt = ''
+      })
+    }
+    return state
+  })
+}
+
+async function updateModelSchedule(body = {}) {
+  const providerId = String(body.providerId || '')
+  const agent = body.agent
+  const modelName = String(body.modelName || '')
+  const enabled = body.scheduleEnabled === true
+  return updateState((state) => {
+    const provider = state.providers.find((item) => item.id === providerId)
+    const model = provider?.models.find((item) => item.agent === agent && item.name === modelName)
+    if (model) {
+      model.scheduleEnabled = enabled
+      if (!enabled) model.nextRunAt = ''
+    }
+    return state
+  })
+}
+
+async function exportBackup() {
+  const state = await loadState({ includeRuns: false })
+  const runs = await loadRuns()
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    state: {
+      providers: state.providers,
+      settings: state.settings
+    },
+    runs
+  }
+}
+
+async function importBackup(body = {}) {
+  const backup = body.backup || body
+  if (!backup || typeof backup !== 'object') throw new Error('invalid_backup')
+  const sourceState = backup.state && typeof backup.state === 'object' ? backup.state : backup
+  const settings = normalizeSettings(sourceState.settings || {})
+  const providers = Array.isArray(sourceState.providers)
+    ? sourceState.providers.map((provider) => normalizeProvider({
+        ...provider,
+        codexConfig: provider.codexConfig || settings.defaultCodexConfig,
+        claudeSettings: provider.claudeSettings || settings.defaultClaudeSettings
+      }))
+    : []
+  const runs = Array.isArray(backup.runs) ? backup.runs : []
+
+  const next = stateWriteQueue.then(async () => {
+    await rm(join(dataDir, 'providers'), { recursive: true, force: true })
+    const imported = { providers, settings, runs: [] }
+    await saveState(imported)
+    await saveRuns(runs)
+    for (const provider of providers) await materializeProvider(provider)
+    return { ...imported, runs }
+  })
+  stateWriteQueue = next.catch(() => undefined)
+  return next
+}
+
 function resetProviderRuns(provider) {
   provider.lastRunAt = ''
   provider.nextRunAt = ''
@@ -410,6 +515,9 @@ function buildClaudeSettings(provider, model, proxyBaseUrl = '') {
   try { parsed = JSON.parse(provider.claudeSettings || '{}') } catch { parsed = {} }
   parsed.env = { ...(parsed.env || {}) }
   if (proxyBaseUrl || provider.baseUrl) parsed.env.ANTHROPIC_BASE_URL = proxyBaseUrl || provider.baseUrl
+  parsed.env.MAX_THINKING_TOKENS = parsed.env.MAX_THINKING_TOKENS || '0'
+  parsed.env.CLAUDE_CODE_EFFORT_LEVEL = parsed.env.CLAUDE_CODE_EFFORT_LEVEL || 'low'
+  parsed.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY = parsed.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY || '1'
   if (model?.agent === 'claude') {
     parsed.env.ANTHROPIC_MODEL = model.name
     parsed.env.ANTHROPIC_DEFAULT_SONNET_MODEL = model.name
@@ -427,6 +535,11 @@ function envKeyFromCodexConfig(text) {
 function commandParts(value) {
   const parts = String(value || '').match(/(?:[^\s"]+|"[^"]*")+/g) || []
   return parts.map((part) => part.replace(/^"|"$/g, ''))
+}
+
+function promptFor(settings, provider, model) {
+  const globalPrompt = model.agent === 'claude' ? settings.claudePrompt : settings.codexPrompt
+  return model.prompt || provider.prompt || globalPrompt || settings.prompt || 'Hello'
 }
 
 async function createCaptureProxy(capture) {
@@ -865,7 +978,7 @@ async function runOne(state, provider, model) {
   const runtimeBaseUrl = runtimeBaseUrlFor(provider, model.agent)
   const runtimeProvider = { ...provider, baseUrl: runtimeBaseUrl }
   const started = Date.now()
-  const prompt = model.prompt || provider.prompt || state.settings.prompt || 'Hello'
+  const prompt = promptFor(state.settings, provider, model)
   const base = providerBase(provider)
   const runBase = join(base, 'run-contexts', safeId(runId))
   const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 20)) * 1000
@@ -905,8 +1018,21 @@ async function runOne(state, provider, model) {
       })
     } else {
       const workspace = join(runBase, 'claude-workspace')
+      const settingsPath = join(workspace, '.claude', 'settings.json')
       const [cmd, ...prefix] = commandParts(state.settings.claudeCommand || 'claude')
-      result = await execProcess(cmd, [...prefix, '-p', prompt], {
+      result = await execProcess(cmd, [
+        ...prefix,
+        '--bare',
+        '--max-turns',
+        '1',
+        '--no-session-persistence',
+        '--effort',
+        'low',
+        '--settings',
+        settingsPath,
+        '-p',
+        prompt
+      ], {
         cwd: workspace,
         env: {
           ...commonEnv,
@@ -914,7 +1040,10 @@ async function runOne(state, provider, model) {
           ANTHROPIC_MODEL: model.name,
           ANTHROPIC_DEFAULT_SONNET_MODEL: model.name,
           ANTHROPIC_DEFAULT_OPUS_MODEL: model.name,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: model.name
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: model.name,
+          MAX_THINKING_TOKENS: '0',
+          CLAUDE_CODE_EFFORT_LEVEL: 'low',
+          CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1'
         },
         timeoutMs
       })
@@ -1064,6 +1193,7 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs.map(publicRunSummary))
+  if (req.method === 'GET' && pathname === '/api/backup/export') return send(res, 200, await exportBackup())
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/)
   if (req.method === 'GET' && runMatch) {
     const runs = await loadRuns()
@@ -1073,6 +1203,18 @@ async function handleApi(req, res, pathname) {
   }
   if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req)), { includeRuns: false }))
   if (req.method === 'POST' && pathname === '/api/runs/clear') return send(res, 200, publicState(await clearRuns(await readJson(req))))
+  if (req.method === 'POST' && pathname === '/api/schedule/settings') {
+    return send(res, 200, publicState(await updateScheduleSettings(await readJson(req)), { includeRuns: false }))
+  }
+  if (req.method === 'POST' && pathname === '/api/schedule/provider') {
+    return send(res, 200, publicState(await updateProviderSchedule(await readJson(req)), { includeRuns: false }))
+  }
+  if (req.method === 'POST' && pathname === '/api/schedule/model') {
+    return send(res, 200, publicState(await updateModelSchedule(await readJson(req)), { includeRuns: false }))
+  }
+  if (req.method === 'POST' && pathname === '/api/backup/import') {
+    return send(res, 200, publicState(await importBackup(await readJson(req))))
+  }
   if (req.method === 'POST' && pathname === '/api/settings') {
     const body = await readJson(req)
     if (body.adminPassword === '') delete body.adminPassword

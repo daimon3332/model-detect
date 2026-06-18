@@ -1,4 +1,4 @@
-import type { AppState, CheckJob, CheckTarget, GlobalSettings, ProviderConfig, TestRun } from './types'
+import type { AgentType, AppState, BackupData, CheckJob, CheckTarget, GlobalSettings, ProviderConfig, TestRun } from './types'
 import { loadState as loadLocalState } from './mockApi'
 
 export const loadInitialState = () => loadLocalState()
@@ -60,6 +60,42 @@ export async function getRunApi(runId: string) {
 
 export async function saveSettingsApi(state: AppState, extra: Partial<GlobalSettings> = {}) {
   const next = await api<AppState>('/api/settings', { method: 'POST', body: { ...state.settings, ...extra } })
+  assignState(state, next)
+}
+
+export async function saveScheduleSettingsApi(
+  state: AppState,
+  body: Pick<GlobalSettings, 'scheduleEnabled' | 'scheduleDays' | 'scheduleHours' | 'scheduleMinutes'>
+) {
+  const next = await api<AppState>('/api/schedule/settings', { method: 'POST', body })
+  assignState(state, next)
+}
+
+export async function saveProviderScheduleApi(state: AppState, providerId: string, scheduleEnabled: boolean) {
+  const next = await api<AppState>('/api/schedule/provider', { method: 'POST', body: { providerId, scheduleEnabled } })
+  assignState(state, next)
+}
+
+export async function saveModelScheduleApi(
+  state: AppState,
+  providerId: string,
+  agent: AgentType,
+  modelName: string,
+  scheduleEnabled: boolean
+) {
+  const next = await api<AppState>('/api/schedule/model', {
+    method: 'POST',
+    body: { providerId, agent, modelName, scheduleEnabled }
+  })
+  assignState(state, next)
+}
+
+export async function exportBackupApi() {
+  return api<BackupData>('/api/backup/export')
+}
+
+export async function importBackupApi(state: AppState, backup: BackupData) {
+  const next = await api<AppState>('/api/backup/import', { method: 'POST', body: { backup, mode: 'replace' } })
   assignState(state, next)
 }
 

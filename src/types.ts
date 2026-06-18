@@ -37,6 +37,8 @@ export interface GlobalSettings {
   claudeCommand: string
   dataDir: string
   prompt: string
+  codexPrompt: string
+  claudePrompt: string
   scheduleEnabled: boolean
   scheduleDays: number
   scheduleHours: number
@@ -54,6 +56,16 @@ export interface CheckTarget {
   providerId?: string
   agent?: AgentType
   modelName?: string
+}
+
+export interface BackupData {
+  version: number
+  exportedAt: string
+  state: {
+    providers: ProviderConfig[]
+    settings: GlobalSettings
+  }
+  runs: TestRun[]
 }
 
 export interface CheckJob {

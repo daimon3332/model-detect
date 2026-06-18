@@ -7,6 +7,8 @@ const defaultSettings: GlobalSettings = {
   claudeCommand: 'claude',
   dataDir: './data',
   prompt: 'Hello',
+  codexPrompt: 'Hello',
+  claudePrompt: 'Reply exactly: ok',
   scheduleEnabled: false,
   scheduleDays: 0,
   scheduleHours: 0,
@@ -36,7 +38,10 @@ const defaultClaudeSettings = `{
   "env": {
     "ANTHROPIC_BASE_URL": "https://example.com/anthropic",
     "ANTHROPIC_AUTH_TOKEN": "",
-    "ANTHROPIC_MODEL": ""
+    "ANTHROPIC_MODEL": "",
+    "MAX_THINKING_TOKENS": "0",
+    "CLAUDE_CODE_EFFORT_LEVEL": "low",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1"
   }
 }
 `
@@ -59,6 +64,12 @@ export function loadState(): AppState {
 
 function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   const merged = { ...defaultSettings, ...(settings ?? {}) }
+  const legacyPrompt = String(settings?.prompt || '').trim()
+  merged.codexPrompt = String(settings?.codexPrompt || legacyPrompt || defaultSettings.codexPrompt)
+  merged.claudePrompt = String(
+    settings?.claudePrompt || (legacyPrompt && legacyPrompt.toLowerCase() !== 'hello' ? legacyPrompt : defaultSettings.claudePrompt)
+  )
+  merged.prompt = String(settings?.prompt || merged.codexPrompt || defaultSettings.prompt)
   if (settings && settings.scheduleDays === undefined && settings.scheduleHours === undefined) {
     const total = Math.max(0, Number(settings.scheduleMinutes ?? defaultSettings.scheduleMinutes))
     merged.scheduleDays = Math.floor(total / 1440)
@@ -113,7 +124,7 @@ export function makeModels(text: string, agent: AgentType): ProviderModel[] {
       agent,
       enabled: true,
       prompt: '',
-      scheduleEnabled: true
+      scheduleEnabled: false
     }))
 }
 
@@ -166,6 +177,7 @@ function makeRun(app: AppState, provider: ProviderConfig, model: ProviderModel):
   const state = randomState()
   const ok = state === 'success' || state === 'warning'
   const httpStatus = state === 'timeout' ? null : ok ? 200 : Math.random() > 0.5 ? 429 : 500
+  const prompt = model.prompt || provider.prompt || (model.agent === 'claude' ? app.settings.claudePrompt : app.settings.codexPrompt) || app.settings.prompt || 'Hello'
   const errorMessage =
     state === 'timeout'
       ? 'CLI process timed out'
@@ -186,7 +198,7 @@ function makeRun(app: AppState, provider: ProviderConfig, model: ProviderModel):
     cliExitCode: state === 'timeout' ? null : ok ? 0 : 1,
     latencyMs: state === 'timeout' ? provider.timeoutSeconds * 1000 : Math.round(800 + Math.random() * 4200),
     createdAt: new Date().toISOString(),
-    prompt: model.prompt || provider.prompt || app.settings.prompt || 'Hello',
+    prompt,
     stdout: ok ? 'hello' : '',
     stderr: state === 'warning' ? 'CLI returned non-fatal warning' : errorMessage,
     errorMessage,
@@ -198,7 +210,7 @@ function makeRun(app: AppState, provider: ProviderConfig, model: ProviderModel):
       },
       body: {
         model: model.name,
-        input: model.prompt || provider.prompt || app.settings.prompt || 'Hello'
+        input: prompt
       }
     },
     response: {

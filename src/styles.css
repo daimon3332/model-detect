@@ -153,6 +153,10 @@ button {
   justify-content: flex-end;
 }
 
+.hidden-file-input {
+  display: none;
+}
+
 .section-head > div:first-child {
   display: grid;
   gap: 4px;
@@ -569,6 +573,16 @@ pre,
   flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.detail-meta-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #64748b;
+  font-size: 12px;
 }
 
 .detail-full-pre {
