@@ -604,7 +604,33 @@ data/providers/<provider-id>/claude-workspace/.claude/settings.json
 claude --bare --max-turns 1 --no-session-persistence --effort low --settings <run-settings.json> -p "Reply exactly: ok"
 ```
 
-`--bare` 用于脚本检测场景，跳过 hooks、skills、plugins、MCP servers、auto memory 和 CLAUDE.md 自动发现，减少启动开销。运行时还会设置：
+不会修改用户级 Claude Code 配置。
+
+### Claude Code 省 token 策略
+
+当前默认 Claude Code 检测目标是“只确认有文本输出”，不是让模型正常聊天。因此默认使用：
+
+```text
+Prompt: Reply exactly: ok
+```
+
+后端实际调用：
+
+```bash
+claude --bare --max-turns 1 --no-session-persistence --effort low --settings <run-settings.json> -p "Reply exactly: ok"
+```
+
+含义：
+
+```text
+--bare                  跳过 hooks / skills / plugins / MCP / auto memory / CLAUDE.md 自动发现
+--max-turns 1           限制 agent turn
+--no-session-persistence 不保存会话历史
+--effort low            降低 reasoning effort
+--settings              继续使用本项目为当前 provider/run 生成的隔离 settings.json
+```
+
+运行时还会设置：
 
 ```text
 MAX_THINKING_TOKENS=0
@@ -612,7 +638,42 @@ CLAUDE_CODE_EFFORT_LEVEL=low
 CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
 ```
 
-不会修改用户级 Claude Code 配置。
+这套方案优先减少 Claude Code 的启动上下文、历史持久化、thinking/reasoning 和回复长度，同时保留真实 Claude Code CLI 发起请求和本地代理抓包。
+
+### Codex 省 token 策略
+
+Codex 当前已使用非交互命令：
+
+```bash
+codex exec --skip-git-repo-check --json "Hello"
+```
+
+可选优化：
+
+```text
+1. 把 Codex 全局 Prompt 改成 Reply exactly: ok
+2. 在 Codex 默认 config.toml 中加入 model_verbosity = "low"
+3. 在 Codex 默认 config.toml 中加入 model_reasoning_effort = "low"
+4. 保持 model_reasoning_summary = "none"
+```
+
+示例：
+
+```toml
+model_verbosity = "low"
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
+```
+
+说明：
+
+```text
+model_verbosity = "low"       控制 GPT-5 系列最终输出长度
+model_reasoning_effort = "low" 降低 reasoning token 消耗
+model_reasoning_summary = "none" 不生成 reasoning summary
+```
+
+更激进的方案是让 Codex 在完全空的临时 workspace 中运行，避免读取项目说明、AGENTS.md、仓库上下文等额外提示；但这样会更不像真实项目内 Codex CLI 调用。当前项目默认保留真实 CLI 行为，只把可控 prompt / verbosity / reasoning 调低。
 
 ## 代理机制
 

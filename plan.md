@@ -233,3 +233,24 @@ node --check server/index.mjs
 ```
 
 通过后再提交和推送。
+
+## 本轮追加文档更新
+
+1. 回答 Codex 是否还有更省 token 的方案。
+2. 将当前 Claude Code 省 token 方案补充到 README。
+3. README 新增 Codex 省 token 策略说明：
+   - 更短 prompt：`Reply exactly: ok`
+   - `model_verbosity = "low"`
+   - `model_reasoning_effort = "low"`
+   - `model_reasoning_summary = "none"`
+   - 空临时 workspace 属于更激进方案，会降低真实项目内 CLI 调用相似度，暂不作为默认。
+4. README 明确 Claude Code 当前方案：
+   - `Reply exactly: ok`
+   - `--bare`
+   - `--max-turns 1`
+   - `--no-session-persistence`
+   - `--effort low`
+   - `--settings <run-settings.json>`
+   - `MAX_THINKING_TOKENS=0`
+   - `CLAUDE_CODE_EFFORT_LEVEL=low`
+   - `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1`
