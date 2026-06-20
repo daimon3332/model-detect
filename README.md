@@ -167,6 +167,14 @@ systemd 服务仍会把应用日志追加写入：
 /root/model-detect/server.log
 ```
 
+检测记录采用轻量化保存策略，避免 `runs.json` 过大导致 Node 被 OOM Killer 杀掉：
+
+```text
+data/runs.json          最多保留最近 500 条详情
+data/runs-summary.json  最多保留最近 1000 条摘要，首页和日志列表优先读取它
+单个大文本字段保存前会截断，避免单条请求/响应 body 撑爆内存
+```
+
 更新代码后使用：
 
 ```bash

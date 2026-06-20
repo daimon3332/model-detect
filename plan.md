@@ -54,6 +54,7 @@ data/runs.json = 121M
    - `GET /api/logs` 只返回 summary。
    - 删除 provider / 清空 runs 后返回轻量 state，不把完整 runs 带回前端。
    - `saveRun()` 的保留上限从 5000 降低，避免 `runs.json` 无限变大。
+   - 保存前对单条 run 内的大文本字段做截断，避免 74 条记录也达到 121MB。
 2. 修复定时任务空 job：
    - `runChecks()` 内部所有 `touchJob/updateJobItem/job.completed` 都先判断 `job` 是否存在。
 3. 保留单条详情接口：

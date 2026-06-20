@@ -16,7 +16,8 @@ const runsFile = join(dataDir, 'runs.json')
 const runsSummaryFile = join(dataDir, 'runs-summary.json')
 const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
-const maxCapturedBodyChars = 2_000_000
+const maxCapturedBodyChars = 300_000
+const maxStoredTextChars = 120_000
 const maxStoredRuns = 500
 const maxRunSummaries = 1000
 const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
@@ -238,7 +239,7 @@ async function saveState(state) {
 
 async function saveRuns(runs) {
   await mkdir(dataDir, { recursive: true })
-  const limited = runs.slice(0, maxStoredRuns)
+  const limited = runs.slice(0, maxStoredRuns).map(pruneRunForStorage)
   await writeFile(runsFile, JSON.stringify(limited, null, 2))
   await saveRunSummaries(limited.slice(0, maxRunSummaries).map(publicRunSummary))
 }
@@ -246,6 +247,22 @@ async function saveRuns(runs) {
 async function saveRunSummaries(summaries) {
   await mkdir(dataDir, { recursive: true })
   await writeFile(runsSummaryFile, JSON.stringify(summaries.slice(0, maxRunSummaries), null, 2))
+}
+
+function pruneRunForStorage(run) {
+  return pruneLargeText(run)
+}
+
+function pruneLargeText(value) {
+  if (typeof value === 'string') {
+    if (value.length <= maxStoredTextChars) return value
+    return `${value.slice(0, maxStoredTextChars)}\n...[truncated ${value.length - maxStoredTextChars} chars for storage]`
+  }
+  if (Array.isArray(value)) return value.map(pruneLargeText)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, pruneLargeText(entry)]))
+  }
+  return value
 }
 
 async function updateState(mutator) {
