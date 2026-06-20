@@ -250,7 +250,8 @@ async function saveRunSummaries(summaries) {
 }
 
 function pruneRunForStorage(run) {
-  return pruneLargeText(run)
+  const { exchanges, ...singleExchangeRun } = run
+  return pruneLargeText(singleExchangeRun)
 }
 
 function pruneLargeText(value) {
