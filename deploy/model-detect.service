@@ -1,0 +1,20 @@
+[Unit]
+Description=Model Detect
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/model-detect
+Environment=PORT=20020
+Environment=PATH=/root/.nvm/versions/node/v24.16.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/.nvm/versions/node/v24.16.0/bin/npm run server
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=append:/root/model-detect/server.log
+StandardError=append:/root/model-detect/server.log
+
+[Install]
+WantedBy=multi-user.target

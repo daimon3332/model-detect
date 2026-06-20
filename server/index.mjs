@@ -13,9 +13,12 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const dataDir = resolve(process.env.MODEL_DETECT_DATA_DIR || join(root, 'data'))
 const stateFile = join(dataDir, 'state.json')
 const runsFile = join(dataDir, 'runs.json')
+const runsSummaryFile = join(dataDir, 'runs-summary.json')
 const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
 const maxCapturedBodyChars = 2_000_000
+const maxStoredRuns = 500
+const maxRunSummaries = 1000
 const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
 
 const defaultCodexConfig = `model_reasoning_summary = "none"
@@ -155,6 +158,19 @@ async function loadRuns(fallbackState = null) {
   }
 }
 
+async function loadRunSummaries(limit = maxRunSummaries) {
+  await mkdir(dataDir, { recursive: true })
+  try {
+    const parsed = JSON.parse(await readFile(runsSummaryFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed.slice(0, limit) : []
+  } catch {
+    const runs = await loadRuns()
+    const summaries = runs.slice(0, limit).map(publicRunSummary)
+    await saveRunSummaries(summaries)
+    return summaries
+  }
+}
+
 function normalizeSettings(settings = {}) {
   const merged = { ...defaults.settings, ...settings }
   const legacyPrompt = String(settings.prompt || '').trim()
@@ -222,7 +238,14 @@ async function saveState(state) {
 
 async function saveRuns(runs) {
   await mkdir(dataDir, { recursive: true })
-  await writeFile(runsFile, JSON.stringify(runs, null, 2))
+  const limited = runs.slice(0, maxStoredRuns)
+  await writeFile(runsFile, JSON.stringify(limited, null, 2))
+  await saveRunSummaries(limited.slice(0, maxRunSummaries).map(publicRunSummary))
+}
+
+async function saveRunSummaries(summaries) {
+  await mkdir(dataDir, { recursive: true })
+  await writeFile(runsSummaryFile, JSON.stringify(summaries.slice(0, maxRunSummaries), null, 2))
 }
 
 async function updateState(mutator) {
@@ -287,8 +310,14 @@ function publicRunSummary(run) {
 function publicState(state, options = {}) {
   const { adminPassword, ...settings } = state.settings
   const result = { providers: state.providers, settings }
-  if (options.includeRuns !== false) result.runs = (state.runs || []).map(publicRunSummary)
+  if (options.includeRuns !== false) result.runs = (options.runs || state.runs || []).map(publicRunSummary)
   return result
+}
+
+async function publicAppState(options = {}) {
+  const state = await loadState({ includeRuns: false })
+  if (options.includeRuns === false) return publicState(state, { includeRuns: false })
+  return publicState(state, { runs: await loadRunSummaries(options.limit) })
 }
 
 function parseCookies(req) {
@@ -374,12 +403,11 @@ async function upsertProvider(provider) {
 
 async function deleteProvider(id) {
   await rm(join(dataDir, 'providers', safeId(id)), { recursive: true, force: true })
-  const nextRuns = await updateRuns((runs) => runs.filter((item) => item.providerId !== id))
-  const state = await updateState((current) => {
+  await updateRuns((runs) => runs.filter((item) => item.providerId !== id))
+  return updateState((current) => {
     current.providers = current.providers.filter((item) => item.id !== id)
     return current
   })
-  return { ...state, runs: nextRuns }
 }
 
 async function resetProviderConfig(body = {}) {
@@ -434,7 +462,7 @@ async function clearRuns(target = {}) {
     if (!latestProviderRun) provider.nextRunAt = ''
     return state
   })
-  return { ...state, runs: nextRuns }
+  return state
 }
 
 async function updateScheduleSettings(body = {}) {
@@ -1116,10 +1144,12 @@ async function runChecks(target = {}, scheduled = false, job = null) {
           errorMessage: error.message
         })
       }
-      touchJob(job, {
-        stage: 'running',
-        message: `已完成 ${job.completed}/${targets.length}`
-      })
+      if (job) {
+        touchJob(job, {
+          stage: 'running',
+          message: `已完成 ${job.completed}/${targets.length}`
+        })
+      }
     })
   ))
 
@@ -1129,7 +1159,7 @@ async function runChecks(target = {}, scheduled = false, job = null) {
 }
 
 async function saveRun(run, scheduled = false) {
-  await updateRuns((runs) => [run, ...runs].slice(0, 5000))
+  await updateRuns((runs) => [run, ...runs].slice(0, maxStoredRuns))
   return updateState((current) => {
     const intervalMs = scheduleIntervalMs(current.settings)
     const provider = current.providers.find((item) => item.id === run.providerId)
@@ -1378,14 +1408,14 @@ async function handleApi(req, res, pathname) {
 
   if (!isAuthenticated(req)) return send(res, 401, { error: 'unauthorized' })
 
-  if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, publicState(await loadState()))
-  if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, (await loadState()).runs.map(publicRunSummary))
+  if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, await publicAppState())
+  if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, await loadRunSummaries())
   if (req.method === 'GET' && pathname === '/api/backup/export') return send(res, 200, await exportBackup())
   const backupJobMatch = pathname.match(/^\/api\/backup\/import\/([^/]+)$/)
   if (req.method === 'GET' && backupJobMatch) {
     const job = backupJobs.get(backupJobMatch[1])
     if (!job) return send(res, 404, { error: 'backup_job_not_found' })
-    return send(res, 200, { job: publicBackupJob(job), state: job.done ? publicState(await loadState()) : undefined })
+    return send(res, 200, { job: publicBackupJob(job), state: job.done ? await publicAppState() : undefined })
   }
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/)
   if (req.method === 'GET' && runMatch) {
@@ -1400,7 +1430,10 @@ async function handleApi(req, res, pathname) {
     return send(res, 200, publicState(await resetProviderConfig(body), { includeRuns: false }))
   }
   if (req.method === 'POST' && pathname === '/api/providers') return send(res, 200, publicState(await upsertProvider(await readJson(req)), { includeRuns: false }))
-  if (req.method === 'POST' && pathname === '/api/runs/clear') return send(res, 200, publicState(await clearRuns(await readJson(req))))
+  if (req.method === 'POST' && pathname === '/api/runs/clear') {
+    await clearRuns(await readJson(req))
+    return send(res, 200, await publicAppState())
+  }
   if (req.method === 'POST' && pathname === '/api/schedule/settings') {
     return send(res, 200, publicState(await updateScheduleSettings(await readJson(req)), { includeRuns: false }))
   }
@@ -1436,10 +1469,13 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && jobMatch) {
     const job = jobs.get(jobMatch[1])
     if (!job) return send(res, 404, { error: 'job_not_found' })
-    return send(res, 200, { job: publicJob(job), state: job.done ? publicState(await loadState()) : undefined })
+    return send(res, 200, { job: publicJob(job), state: job.done ? await publicAppState() : undefined })
   }
   const deleteMatch = pathname.match(/^\/api\/providers\/([^/]+)$/)
-  if (req.method === 'DELETE' && deleteMatch) return send(res, 200, publicState(await deleteProvider(deleteMatch[1])))
+  if (req.method === 'DELETE' && deleteMatch) {
+    await deleteProvider(deleteMatch[1])
+    return send(res, 200, await publicAppState())
+  }
   send(res, 404, { error: 'not_found' })
 }
 

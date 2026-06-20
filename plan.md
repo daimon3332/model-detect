@@ -1,5 +1,94 @@
 # Plan
 
+## 当前任务：修复 502 / OOM 崩溃并补充 systemd 部署
+
+### 问题证据
+
+服务器：
+
+```text
+121.37.47.90:/root/model-detect
+```
+
+Nginx 报错：
+
+```text
+connect() failed (111: Connection refused) while connecting to upstream 127.0.0.1:20020
+recv() failed (104: Connection reset by peer) while reading response header from upstream
+```
+
+后端日志：
+
+```text
+TypeError: Cannot read properties of null (reading 'completed')
+Killed
+```
+
+系统日志：
+
+```text
+Out of memory: Killed process ... (MainThread) anon-rss: 1138324kB
+```
+
+数据文件：
+
+```text
+data/runs.json = 121M
+```
+
+### 原因
+
+1. `runs.json` 过大，多个接口会整文件读取、`JSON.parse`、再返回状态，内存瞬间升高。
+2. `GET /api/checks/:id` 在 job 完成时返回完整 `publicState(await loadState())`，会读完整 runs。
+3. `GET /api/state` 默认读取完整 runs。
+4. `DELETE /api/providers/:id` 删除 provider 时过滤完整 runs 后还把 runs 返回给前端。
+5. `GET /api/runs/:id` 为找单条记录也会读取完整 runs。
+6. 定时任务调用 `runChecks(..., true)` 时没有传 job，但 `runChecks()` 内部读取 `job.completed`，导致 `TypeError`。
+7. 当前用 `nohup` 后台跑服务，被 OOM 杀死后不会自动拉起。
+
+### 实施
+
+1. 后端降低 runs 内存占用：
+   - `GET /api/state` 改为只返回最近有限条 summary。
+   - `GET /api/checks/:id` 完成时只返回轻量 state，不强制读取完整大日志。
+   - `GET /api/logs` 只返回 summary。
+   - 删除 provider / 清空 runs 后返回轻量 state，不把完整 runs 带回前端。
+   - `saveRun()` 的保留上限从 5000 降低，避免 `runs.json` 无限变大。
+2. 修复定时任务空 job：
+   - `runChecks()` 内部所有 `touchJob/updateJobItem/job.completed` 都先判断 `job` 是否存在。
+3. 保留单条详情接口：
+   - `GET /api/runs/:id` 仍可读取详情，但这是用户点击详情时的低频路径。
+4. 新增项目内 systemd 模板：
+
+```text
+deploy/model-detect.service
+```
+
+5. README Linux 部分补充：
+   - systemd 安装部署步骤。
+   - systemd 启动、停止、重启、查看日志。
+   - systemd 删除教程。
+   - 继续保留 nohup 临时启动方式。
+6. 验证：
+
+```bash
+npm run typecheck
+npm run build
+node --check server/index.mjs
+```
+
+当前本地验证结果：
+
+```text
+npm run typecheck               通过
+npm run build                   通过
+node --check server/index.mjs   通过
+```
+
+7. 提交、push，同步 `121.37.47.90`。
+
+---
+
 ## 当前任务：Codex instruction.md 自动创建
 
 ### 问题

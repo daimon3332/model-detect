@@ -115,6 +115,78 @@ http://服务器IP:20020
 
 首次登录后建议立刻到“全局设置”修改默认管理员密码。
 
+### systemd 后台服务部署
+
+生产环境推荐使用 systemd，不推荐长期只用 `nohup`。systemd 会在进程崩溃、被 OOM Killer 杀掉或服务器重启后自动拉起服务。
+
+项目内提供模板：
+
+```text
+deploy/model-detect.service
+```
+
+如果服务器 Node 安装在 nvm 路径，例如：
+
+```text
+/root/.nvm/versions/node/v24.16.0/bin/node
+/root/.nvm/versions/node/v24.16.0/bin/npm
+```
+
+可以直接安装：
+
+```bash
+cd /root/model-detect
+cp deploy/model-detect.service /etc/systemd/system/model-detect.service
+systemctl daemon-reload
+systemctl enable model-detect
+systemctl restart model-detect
+systemctl status model-detect --no-pager
+```
+
+如果你的 Node 路径不同，先修改 `deploy/model-detect.service` 里的：
+
+```text
+Environment=PATH=...
+ExecStart=...
+```
+
+常用命令：
+
+```bash
+systemctl start model-detect
+systemctl stop model-detect
+systemctl restart model-detect
+systemctl status model-detect --no-pager
+journalctl -u model-detect -n 100 --no-pager
+journalctl -u model-detect -f
+```
+
+systemd 服务仍会把应用日志追加写入：
+
+```text
+/root/model-detect/server.log
+```
+
+更新代码后使用：
+
+```bash
+cd /root/model-detect
+git pull
+npm install
+npm run build
+systemctl restart model-detect
+```
+
+删除 systemd 服务：
+
+```bash
+systemctl stop model-detect || true
+systemctl disable model-detect || true
+rm -f /etc/systemd/system/model-detect.service
+systemctl daemon-reload
+systemctl reset-failed model-detect || true
+```
+
 ### 已有仓库更新部署
 
 每次项目更新后，推荐按下面顺序执行：
@@ -124,8 +196,7 @@ cd /root/model-detect
 git pull
 npm install
 npm run build
-fuser -k 20020/tcp || true
-PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
+systemctl restart model-detect
 ```
 
 说明：
@@ -134,7 +205,16 @@ PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 git pull       拉取最新代码
 npm install    依赖有变化时安装；没变化也可以执行，通常很快
 npm run build  重新构建前端 dist
-重启后台服务   推荐每次更新后都重启
+重启后台服务   systemctl restart model-detect
+```
+
+如果没有安装 systemd 服务，才使用临时 `nohup` 方式：
+
+```bash
+cd /root/model-detect
+export PATH=/root/.nvm/versions/node/v24.16.0/bin:$PATH
+fuser -k 20020/tcp || true
+PORT=20020 nohup npm run server > server.log 2>&1 & echo $! > server.pid
 ```
 
 必须重启后台服务的情况：
