@@ -768,3 +768,106 @@ node --check server/index.mjs
 2. 明确说明：只要不确定是否有后端改动，更新后都建议重启后台服务。
 3. 说明纯前端改动理论上构建后即可读取新的 `dist/`，但生产环境仍建议重启，避免旧进程、缓存或状态不同步。
 
+
+---
+
+## 当前任务：修复 Base URL 自动补全导致的 `/v1/v1/messages`
+
+### 问题
+
+Anyrouter 提供商使用 Claude Code 检测时，如果模型提供商 Base URL 填写：
+
+```text
+https://anyrouter.top/v1
+```
+
+Claude Code 会继续追加标准 Anthropic Messages endpoint：
+
+```text
+/v1/messages
+```
+
+旧逻辑没有在 Claude Code 场景下移除 base 末尾的 `/v1`，导致最终请求变成：
+
+```text
+POST /v1/v1/messages
+```
+
+上游返回：
+
+```json
+{
+  "error": {
+    "message": "Invalid URL (POST /v1/v1/messages)",
+    "type": "invalid_request_error"
+  }
+}
+```
+
+### 目标规则
+
+用户填写的是 API base，不是完整 endpoint。项目运行时兼容以下输入：
+
+```text
+裸域名
+带 /v1
+误填完整 endpoint
+带自定义前缀，例如 /anthropic
+```
+
+标准 endpoint：
+
+```text
+OpenAI Chat Completions: /v1/chat/completions
+OpenAI Responses API:    /v1/responses
+Anthropic Messages API:  /v1/messages
+```
+
+运行时拆分规则：
+
+```text
+Claude Code 上游 base 不保留末尾 /v1，因为 CLI 自己追加 /v1/messages。
+Codex 上游 base 需要保留或补齐 /v1，因为 CLI 自己追加 /responses。
+完整 endpoint 会先还原为 base，再交给 CLI 追加自己的 endpoint。
+```
+
+DeepSeek 示例：
+
+```text
+用户填写: https://api.deepseek.com/anthropic
+规范化上游 base: https://api.deepseek.com/anthropic
+Claude Code 追加: /v1/messages
+最终请求路径: /anthropic/v1/messages
+```
+
+不会出现：
+
+```text
+/anthropic/anthropic/v1/messages
+/v1/v1/messages
+```
+
+### 实施
+
+1. 修复 `runtimeBaseUrlFor(provider, agent)`：
+   - 新增 endpoint/base path 规范化逻辑。
+   - Claude Code：移除末尾 `/v1`，保留自定义前缀。
+   - Codex：空 path 自动补 `/v1`，误填 endpoint 自动还原成 `/v1` base。
+2. 新增 `docs/url-normalization.md`：
+   - 记录三种标准 endpoint。
+   - 记录 Codex / Claude Code 的运行时转换规则。
+   - 给出 Anyrouter、DeepSeek、自定义前缀、误填 endpoint 的例子。
+3. 更新 `README.md` 的 Base URL 说明，链接完整文档。
+4. 验证：
+
+```bash
+node --check server/index.mjs
+npm run typecheck
+npm run build
+```
+
+5. 提交、push，并同步到：
+
+```text
+121.37.47.90:/root/model-detect
+```

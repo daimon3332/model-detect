@@ -612,6 +612,8 @@ data/providers/<provider-id>/claude-workspace/.claude/settings.json
 
 模型提供商里填写的是 API base，不是完整 endpoint。
 
+完整规则见：`docs/url-normalization.md`。
+
 标准 endpoint：
 
 ```text
@@ -624,7 +626,7 @@ Anthropic Messages: POST /v1/messages
 
 ```text
 Codex CLI -> /responses
-Claude Code CLI -> /messages
+Claude Code CLI -> /v1/messages
 ```
 
 因此项目只在运行时规范化 `base_url`，不修改保存的 provider 配置。
@@ -632,18 +634,22 @@ Claude Code CLI -> /messages
 Codex 运行时规则：
 
 ```text
-https://anyrouter.top        -> https://anyrouter.top/v1        -> CLI 请求 /v1/responses
-https://shayulajiao.xyz/v1   -> https://shayulajiao.xyz/v1   -> CLI 请求 /v1/responses
-https://gateway.test/compat  -> https://gateway.test/compat  -> CLI 请求 /compat/responses
-https://gateway.test/openai  -> https://gateway.test/openai/v1 -> CLI 请求 /openai/v1/responses
+https://anyrouter.top                      -> https://anyrouter.top/v1          -> 最终 /v1/responses
+https://anyrouter.top/v1                   -> https://anyrouter.top/v1          -> 最终 /v1/responses
+https://anyrouter.top/v1/responses         -> https://anyrouter.top/v1          -> 最终 /v1/responses
+https://anyrouter.top/v1/chat/completions  -> https://anyrouter.top/v1          -> 最终 /v1/responses
+https://gateway.test/openai                -> https://gateway.test/openai/v1    -> 最终 /openai/v1/responses
 ```
 
 Claude Code 运行时规则：
 
 ```text
-https://api.anthropic.com           -> https://api.anthropic.com           -> CLI 请求 /v1/messages
-https://api.deepseek.com/anthropic  -> https://api.deepseek.com/anthropic  -> CLI 请求 /anthropic/v1/messages
-https://api.anthropic.com/v1        -> https://api.anthropic.com/v1        -> CLI 请求 /v1/v1/messages，不推荐这样填
+https://anyrouter.top                         -> https://anyrouter.top                   -> 最终 /v1/messages
+https://anyrouter.top/v1                      -> https://anyrouter.top                   -> 最终 /v1/messages
+https://anyrouter.top/v1/messages             -> https://anyrouter.top                   -> 最终 /v1/messages
+https://api.deepseek.com/anthropic            -> https://api.deepseek.com/anthropic      -> 最终 /anthropic/v1/messages
+https://api.deepseek.com/anthropic/v1         -> https://api.deepseek.com/anthropic      -> 最终 /anthropic/v1/messages
+https://api.deepseek.com/anthropic/v1/messages -> https://api.deepseek.com/anthropic     -> 最终 /anthropic/v1/messages
 ```
 
 DeepSeek 官方 Claude Code 配置应填写：
@@ -652,18 +658,7 @@ DeepSeek 官方 Claude Code 配置应填写：
 https://api.deepseek.com/anthropic
 ```
 
-不要手动改成 `/anthropic/v1`。
-
-以下 path 视为网关前缀，不自动补 `/v1`：
-
-```text
-/compat
-/openai-compatible
-/openai-compat
-/litellm
-/proxy
-/gateway
-```
+DeepSeek 的 `/anthropic` 只来自 base，`/v1/messages` 只来自 Claude Code，最终是 `/anthropic/v1/messages`，不会出现 `/anthropic/anthropic/v1/messages` 或 `/v1/v1/messages`。
 
 如果某个 OpenAI-compatible 网关只支持 `/v1/chat/completions`，Codex 的真实 `/v1/responses` 检测可能失败；这属于上游网关能力问题，日志会展示真实请求和响应。
 

@@ -908,22 +908,35 @@ function runtimeBaseUrlFor(provider, agent) {
   const raw = String(provider.baseUrl || '').trim()
   if (!raw) return raw
   const url = new URL(raw)
-  const path = url.pathname.replace(/\/+$/, '')
-  const lower = path.toLowerCase()
-  const endpointPattern = /\/(v\d+\/)?(responses|chat\/completions|messages|completions)$/
-  const gatewayPrefixes = ['/compat', '/openai-compatible', '/openai-compat', '/litellm', '/proxy', '/gateway']
+  const path = stripKnownEndpointPath(url.pathname)
+  url.search = ''
+  url.hash = ''
   if (agent === 'claude') {
-    url.pathname = path || '/'
-  } else if (!path || path === '/') {
-    url.pathname = '/v1'
-  } else if (/\/v\d+$/.test(lower) || endpointPattern.test(lower)) {
-    url.pathname = path
-  } else if (gatewayPrefixes.some((prefix) => lower.endsWith(prefix))) {
-    url.pathname = path
+    url.pathname = stripTrailingVersionPath(path) || '/'
   } else if (agent === 'codex') {
-    url.pathname = `${path}/v1`
+    url.pathname = ensureTrailingVersionPath(path)
   }
   return url.toString().replace(/\/$/, '')
+}
+
+function stripKnownEndpointPath(pathname) {
+  const segments = String(pathname || '').split('/').filter(Boolean)
+  const lower = segments.map((item) => item.toLowerCase())
+  if (lower.at(-2) === 'chat' && lower.at(-1) === 'completions') segments.splice(-2, 2)
+  else if (['responses', 'messages', 'completions'].includes(lower.at(-1))) segments.pop()
+  return segments.length ? `/${segments.join('/')}` : ''
+}
+
+function stripTrailingVersionPath(pathname) {
+  const segments = String(pathname || '').split('/').filter(Boolean)
+  if (/^v\d+$/i.test(segments.at(-1) || '')) segments.pop()
+  return segments.length ? `/${segments.join('/')}` : ''
+}
+
+function ensureTrailingVersionPath(pathname) {
+  const segments = String(pathname || '').split('/').filter(Boolean)
+  if (!/^v\d+$/i.test(segments.at(-1) || '')) segments.push('v1')
+  return `/${segments.join('/')}`
 }
 
 function normalizeHeaders(headers) {
