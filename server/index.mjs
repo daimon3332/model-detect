@@ -789,6 +789,7 @@ async function proxyRequest(req, res, context) {
   delete outboundHeaders.host
   delete outboundHeaders.connection
   delete outboundHeaders['content-length']
+  applyProviderAuthHeaders(outboundHeaders, context)
 
   const upstream = await requestUpstream(
     targetUrl,
@@ -884,6 +885,13 @@ function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeou
     if (body) upstreamReq.write(body)
     upstreamReq.end()
   })
+}
+
+function applyProviderAuthHeaders(headers, context) {
+  const apiKey = String(context.apiKey || '').trim()
+  if (!apiKey) return
+  headers.authorization = `Bearer ${apiKey}`
+  if (context.agent === 'claude') headers['x-api-key'] = apiKey
 }
 
 function buildTargetUrl(context, requestUrl) {
@@ -1222,6 +1230,7 @@ async function runOne(state, provider, model) {
     providerId: provider.id,
     agent: model.agent,
     model: model.name,
+    apiKey: provider.apiKey || '',
     upstreamBaseUrl: runtimeBaseUrl,
     proxyBaseUrl: '',
     proxyUrl: provider.proxyUrl || '',
@@ -1314,9 +1323,18 @@ async function runOne(state, provider, model) {
   }
   const hasText = result.stdout.trim().length > 0
   const timedOut = result.timedOut
-  const ok = !timedOut && result.exitCode === 0 && hasText
-  const runState = timedOut ? 'timeout' : ok ? 'success' : result.exitCode === 0 ? 'warning' : 'failed'
-  const errorMessage = ok ? '' : timedOut ? 'CLI process timed out' : result.stderr.trim() || 'No valid text output'
+  const providerErrorMessage = extractProviderErrorMessage(exchange?.response?.body)
+  const hasUpstreamExchange = Boolean(exchange)
+  const hasUpstreamError = Boolean(exchange && Number(exchange.statusCode) >= 400)
+  const ok = !timedOut && !hasUpstreamError && result.exitCode === 0 && hasText
+  const runState = timedOut && !hasUpstreamExchange ? 'timeout' : ok ? 'success' : result.exitCode === 0 && !hasUpstreamError ? 'warning' : 'failed'
+  const errorMessage = ok
+    ? ''
+    : providerErrorMessage || (timedOut && hasUpstreamExchange
+        ? 'CLI timed out after upstream response'
+        : timedOut
+          ? 'CLI process timed out'
+          : result.stderr.trim() || 'No valid text output')
 
   return {
     id: runId,
@@ -1341,6 +1359,33 @@ async function runOne(state, provider, model) {
     logDetail,
     exchanges: capture.exchanges
   }
+}
+
+function extractProviderErrorMessage(body) {
+  if (!body) return ''
+  if (typeof body === 'string') {
+    const trimmed = body.trim()
+    if (!trimmed) return ''
+    const parsed = parseJsonLikeError(trimmed)
+    if (parsed) return extractProviderErrorMessage(parsed)
+    const match = trimmed.match(/"message"\s*:\s*"([^"]+)"/)
+    return match ? match[1] : trimmed.slice(0, 500)
+  }
+  if (typeof body !== 'object') return String(body)
+  const error = body.error
+  if (error && typeof error === 'object') return String(error.message || error.type || error.code || '').trim()
+  if (error) return String(error)
+  return String(body.message || body.type || '').trim()
+}
+
+function parseJsonLikeError(text) {
+  try { return JSON.parse(text) } catch {}
+  const dataLine = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith('data:') && line.includes('{'))
+  if (!dataLine) return null
+  try { return JSON.parse(dataLine.replace(/^data:\s*/, '')) } catch { return null }
 }
 
 function buildRequest(provider, model, prompt) {

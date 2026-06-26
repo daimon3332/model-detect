@@ -1396,3 +1396,16 @@ crypto.randomUUID 可用时使用 crypto.randomUUID
 
 因此在普通 HTTP 页面下也可以正常添加模型提供商。
 
+
+### Claude Code 鉴权头和 Timeout 展示
+
+日志详情中：
+
+```text
+client_headers  = CLI 原始请求头
+forward_headers = 实际转发给上游的请求头
+```
+
+Claude Code 检测时，代理会用当前 provider 的 API Key 覆盖 `authorization` 和 `x-api-key`，避免旧环境变量或 CLI 默认值污染上游鉴权。
+
+如果 CLI 进程超时，但代理已经捕获到上游 HTTP 响应，页面优先显示上游 HTTP 状态码和错误信息；只有完全没有捕获到上游响应时才显示 Timeout。

@@ -96,3 +96,23 @@ DeepSeek Claude Code: https://api.deepseek.com/anthropic
 ```
 
 不要手动填写完整 endpoint；即使填写了，项目也会尽量还原成正确 base。
+
+## Claude Code 鉴权头和超时显示
+
+Claude Code CLI 的原始请求可能同时带有：
+
+```text
+authorization: Bearer <token>
+x-api-key: <token>
+```
+
+项目的捕获代理会保留 `client_headers` 用于观察 CLI 原始请求，但转发到上游时会使用当前模型提供商配置的 API Key 统一覆盖：
+
+```text
+authorization: Bearer <provider.apiKey>
+x-api-key: <provider.apiKey>
+```
+
+这样可以避免 CLI 环境变量或旧 settings 里残留的 `x-api-key` 被上游优先校验，导致“无效的令牌”。
+
+如果 CLI 最终超时，但代理已经捕获到上游 HTTP 响应，页面优先展示上游状态码和错误体。例如上游已返回 401/429/503 时，检测结果显示 `failed + HTTP 状态码 + provider error.message`，不再简单显示 `timeout`。只有完全没有捕获到模型请求响应时，才显示 `timeout`。

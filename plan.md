@@ -871,3 +871,83 @@ npm run build
 ```text
 121.37.47.90:/root/model-detect
 ```
+
+---
+
+## 当前任务：根据服务器日志修复 Claude Code Anyrouter 状态和鉴权
+
+### 服务器日志证据
+
+服务器：
+
+```text
+121.37.47.90:/root/model-detect
+HEAD = 5c715fb
+service = active
+```
+
+最新 Anyrouter / Claude Code / `claude-opus-4-8` 检测记录：
+
+```text
+run id: 09118341-25b0-4c5d-ae37-ff25a86cab9e
+state: timeout
+httpStatus: 401
+errorMessage: CLI process timed out
+forward_url: https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1/messages?beta=true
+provider_body.error.message: 无效的令牌
+```
+
+结论：
+
+1. 新版本路径已经正确，不再是 `/v1/v1/messages`。
+2. 真实上游已经返回 HTTP 错误，页面却显示 Timeout，是状态判定 bug。
+3. 请求头同时存在：
+
+```text
+authorization: Bearer <provider api key>
+x-api-key: 12346
+```
+
+Claude Code CLI 自带的 `x-api-key` 被原样转发到上游。部分 Anthropic-compatible 网关会优先校验 `x-api-key`，因此返回“无效的令牌”。
+
+### 修复方案
+
+1. 代理上下文增加 `apiKey`。
+2. `proxyRequest()` 转发 Claude 请求时强制规范鉴权头：
+   - `authorization = Bearer <provider.apiKey>`
+   - `x-api-key = <provider.apiKey>`
+   - 删除空值鉴权头。
+3. 保留捕获到的原始 CLI 请求头在 `client_headers`，但 `forward_headers` 展示真实发给上游的修正后请求头。
+4. 修复 `runOne()` 状态判定：
+   - 如果 CLI timeout 但已经捕获到上游 exchange，优先显示上游 `httpStatus` 和错误体。
+   - 仅在没有捕获到上游 exchange 时显示 `timeout`。
+5. 从上游响应体提取错误信息：
+   - `error.message`
+   - `message`
+   - `error`
+6. 更新 README 和 `docs/url-normalization.md`，记录：
+   - 路径规范化已正确。
+   - CLI 超时但有上游响应时，页面优先显示上游 HTTP 错误。
+   - Claude 转发时会用当前 provider API Key 覆盖 CLI 生成的 `x-api-key`。
+
+### 验证
+
+本地：
+
+```bash
+node --check server/index.mjs
+npm run typecheck
+npm run build
+```
+
+服务器：
+
+```bash
+git pull --ff-only
+npm install
+systemctl restart model-detect
+systemctl status model-detect --no-pager
+curl http://127.0.0.1:20020/api/session
+```
+
+不主动发起新的模型检测请求，避免浪费 token。
