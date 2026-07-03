@@ -15,6 +15,7 @@ const defaultSettings: GlobalSettings = {
   scheduleHours: 0,
   scheduleMinutes: 30,
   proxyPort: 7788,
+  defaultTimeoutSeconds: 30,
   maxConcurrentChecks: 1,
   logRetentionDays: 30,
   redactLogs: true,
@@ -88,6 +89,7 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.defaultTimeoutSeconds = Math.min(600, Math.max(5, Number(merged.defaultTimeoutSeconds || 30)))
   merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = ensureTomlSetting(String(merged.defaultCodexConfig || defaultCodexConfig), 'model_verbosity', '"low"')
   merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
@@ -122,7 +124,7 @@ export function createProviderDraft(settings?: Partial<GlobalSettings>): Provide
     codexEnabled: true,
     claudeEnabled: false,
     prompt: '',
-    timeoutSeconds: 20,
+    timeoutSeconds: Math.min(600, Math.max(5, Number(settings?.defaultTimeoutSeconds || 30))),
     scheduleEnabled: false,
     saveBody: true,
     models: [],

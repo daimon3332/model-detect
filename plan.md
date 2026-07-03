@@ -1083,3 +1083,40 @@ curl http://127.0.0.1:20020/api/session
 先用 DeepSeek 单 Claude 模型、短 prompt 验证。
 再测试少量模型，确认不 OOM、不反复重写 runs.json。
 ```
+
+---
+
+## 当前任务：默认超时改为 30 秒并统一耗时单位
+
+### 目标
+
+1. 默认检测超时时间从 20 秒改为 30 秒。
+2. 全局设置增加默认检测超时，可在前端修改。
+3. 单个模型提供商仍然可以覆盖自己的超时时间。
+4. 页面中所有调用耗时不再显示 `ms`，统一显示秒 `s`。
+
+### 实施
+
+1. 后端：
+   - 新增 `defaultTimeoutSeconds = 30`。
+   - `settings.defaultTimeoutSeconds` 默认值为 30。
+   - `normalizeSettings()` 限制范围 `5-600`。
+   - `normalizeProvider()` 的 `timeoutSeconds` 兜底改为 30。
+   - `runOne()` 的超时兜底改为 30。
+2. 前端：
+   - `GlobalSettings` 增加 `defaultTimeoutSeconds`。
+   - mock 默认设置增加 `defaultTimeoutSeconds = 30`。
+   - 新建 provider 默认使用全局默认超时。
+   - 全局设置页增加“默认检测超时（秒）”。
+   - 新增 `formatLatency()`，统一把 `latencyMs` 转成秒展示。
+3. 文档：
+   - README 说明默认超时 30 秒。
+   - README 说明全局默认值和 provider 覆盖关系。
+   - README 说明前端耗时统一显示秒。
+4. 验证：
+
+```bash
+node --check server/index.mjs
+npm run typecheck
+npm run build
+```

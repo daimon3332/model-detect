@@ -44,6 +44,7 @@ export interface GlobalSettings {
   scheduleHours: number
   scheduleMinutes: number
   proxyPort: number
+  defaultTimeoutSeconds: number
   maxConcurrentChecks: number
   logRetentionDays: number
   redactLogs: boolean

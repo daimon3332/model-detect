@@ -23,6 +23,7 @@ const maxCliOutputChars = 50_000
 const maxCapturedExchanges = 3
 const maxStoredRuns = 500
 const maxRunSummaries = 1000
+const defaultTimeoutSeconds = 30
 const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
 
 const defaultCodexConfig = `model_reasoning_summary = "none"
@@ -91,6 +92,7 @@ const defaults = {
     scheduleHours: 0,
     scheduleMinutes: 30,
     proxyPort: 7788,
+    defaultTimeoutSeconds,
     maxConcurrentChecks: 1,
     logRetentionDays: 30,
     redactLogs: true,
@@ -151,10 +153,11 @@ async function loadState(options = {}) {
   const includeRuns = options.includeRuns !== false
   try {
     const parsed = JSON.parse(await readFile(stateFile, 'utf8'))
+    const settings = normalizeSettings(parsed.settings)
     return {
-      providers: Array.isArray(parsed.providers) ? parsed.providers.map(normalizeProvider) : [],
+      providers: Array.isArray(parsed.providers) ? parsed.providers.map((provider) => normalizeProvider(provider, settings.defaultTimeoutSeconds)) : [],
       runs: includeRuns ? await loadRuns(parsed) : [],
-      settings: normalizeSettings(parsed.settings)
+      settings
     }
   } catch {
     const fallback = structuredClone(defaults)
@@ -211,6 +214,7 @@ function normalizeSettings(settings = {}) {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.defaultTimeoutSeconds = Math.min(600, Math.max(5, Number(merged.defaultTimeoutSeconds || defaultTimeoutSeconds)))
   merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
@@ -443,7 +447,8 @@ function modelId(agent, name) {
   return `${agent}:${name}`
 }
 
-function normalizeProvider(provider) {
+function normalizeProvider(provider, timeoutDefault = defaultTimeoutSeconds) {
+  const timeoutSeconds = Number(provider.timeoutSeconds || timeoutDefault || defaultTimeoutSeconds)
   return {
     id: safeId(provider.id),
     name: String(provider.name || '未命名提供商').trim(),
@@ -454,7 +459,7 @@ function normalizeProvider(provider) {
     codexEnabled: provider.codexEnabled !== false,
     claudeEnabled: provider.claudeEnabled === true,
     prompt: provider.prompt || '',
-    timeoutSeconds: Number(provider.timeoutSeconds || 20),
+    timeoutSeconds: Math.min(600, Math.max(5, timeoutSeconds)),
     scheduleEnabled: provider.scheduleEnabled === true,
     saveBody: provider.saveBody !== false,
     models: Array.isArray(provider.models)
@@ -480,9 +485,10 @@ async function upsertProvider(provider) {
   return updateState(async (state) => {
     const next = normalizeProvider({
       ...provider,
+      timeoutSeconds: provider.timeoutSeconds || state.settings.defaultTimeoutSeconds,
       codexConfig: provider.codexConfig || state.settings.defaultCodexConfig,
       claudeSettings: provider.claudeSettings || state.settings.defaultClaudeSettings
-    })
+    }, state.settings.defaultTimeoutSeconds)
     await materializeProvider(next)
     const index = state.providers.findIndex((item) => item.id === next.id)
     if (index >= 0) state.providers.splice(index, 1, next)
@@ -640,11 +646,12 @@ async function importBackup(body = {}) {
   const sourceState = backup.state && typeof backup.state === 'object' ? backup.state : backup
   const settings = normalizeSettings(sourceState.settings || {})
   const providers = Array.isArray(sourceState.providers)
-    ? sourceState.providers.map((provider) => normalizeProvider({
+      ? sourceState.providers.map((provider) => normalizeProvider({
         ...provider,
+        timeoutSeconds: provider.timeoutSeconds || settings.defaultTimeoutSeconds,
         codexConfig: provider.codexConfig || settings.defaultCodexConfig,
         claudeSettings: provider.claudeSettings || settings.defaultClaudeSettings
-      }))
+      }, settings.defaultTimeoutSeconds))
     : []
 
   const next = stateWriteQueue.then(async () => {
@@ -704,11 +711,12 @@ async function runBackupImportJob(job, body = {}) {
   const sourceState = backup.state && typeof backup.state === 'object' ? backup.state : backup
   const settings = normalizeSettings(sourceState.settings || {})
   const providers = Array.isArray(sourceState.providers)
-    ? sourceState.providers.map((provider) => normalizeProvider({
+      ? sourceState.providers.map((provider) => normalizeProvider({
         ...provider,
+        timeoutSeconds: provider.timeoutSeconds || settings.defaultTimeoutSeconds,
         codexConfig: provider.codexConfig || settings.defaultCodexConfig,
         claudeSettings: provider.claudeSettings || settings.defaultClaudeSettings
-      }))
+      }, settings.defaultTimeoutSeconds))
     : []
 
   touchBackupJob(job, {
@@ -1354,7 +1362,7 @@ async function runOne(state, provider, model) {
   const prompt = promptFor(state.settings, provider, model)
   const base = providerBase(provider)
   const runBase = join(base, 'run-contexts', safeId(runId))
-  const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || 20)) * 1000
+  const timeoutMs = Math.max(5, Number(provider.timeoutSeconds || state.settings.defaultTimeoutSeconds || defaultTimeoutSeconds)) * 1000
   const capture = {
     providerId: provider.id,
     agent: model.agent,

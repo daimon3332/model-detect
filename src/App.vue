@@ -167,6 +167,13 @@ const modelOptions = computed(() => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+const formatLatency = (ms: number | null | undefined) => {
+  const value = Number(ms || 0)
+  if (!value) return '-'
+  const seconds = value / 1000
+  return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds).toString()}s`
+}
+
 const jobPercent = (job: CheckJob) => {
   if (!job.total) return job.done ? 100 : 0
   return Math.round((job.completed / job.total) * 100)
@@ -742,7 +749,7 @@ onMounted(boot)
                   <span>{{ agentLabel(item.agent) }}</span>
                   <span class="mono">{{ item.model }}</span>
                   <span>{{ item.httpStatus ?? '-' }}</span>
-                  <span>{{ item.latencyMs ? `${item.latencyMs}ms` : '-' }}</span>
+                  <span>{{ formatLatency(item.latencyMs) }}</span>
                   <span class="job-item-error">{{ item.errorMessage || '-' }}</span>
                 </div>
               </div>
@@ -932,7 +939,7 @@ onMounted(boot)
               <el-tag :type="isHealthy(run) ? 'success' : 'danger'">
                 {{ run.httpStatus ?? stateLabel(run.state) }}
               </el-tag>
-              <span>{{ run.latencyMs }}ms</span>
+              <span>{{ formatLatency(run.latencyMs) }}</span>
               <el-button size="small" @click="openRun(run)">详情</el-button>
             </div>
           </div>
@@ -1005,6 +1012,9 @@ onMounted(boot)
             </el-form-item>
             <el-form-item label="日志保留天数">
               <el-input-number v-model="state.settings.logRetentionDays" :min="1" :max="365" />
+            </el-form-item>
+            <el-form-item label="默认检测超时（秒）">
+              <el-input-number v-model="state.settings.defaultTimeoutSeconds" :min="5" :max="600" />
             </el-form-item>
             <el-form-item label="最大并发检测数">
               <el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="3" />
@@ -1134,7 +1144,7 @@ onMounted(boot)
           <span>{{ activeRun.providerName }}</span>
           <span class="mono">{{ activeRun.model }}</span>
           <span>{{ agentLabel(activeRun.agent) }}</span>
-          <span>{{ activeRun.latencyMs }}ms</span>
+          <span>{{ formatLatency(activeRun.latencyMs) }}</span>
         </div>
         <div class="detail-button-row">
           <el-button
