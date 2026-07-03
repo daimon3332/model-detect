@@ -951,3 +951,135 @@ curl http://127.0.0.1:20020/api/session
 ```
 
 不主动发起新的模型检测请求，避免浪费 token。
+
+---
+
+## 当前任务：降低多模型检测卡死和服务器崩溃风险
+
+### 服务器现状证据
+
+服务器：
+
+```text
+121.37.47.90:/root/model-detect
+model-detect.service: active
+model-detect 当前内存约 100M，历史 peak 约 571M
+服务器总内存 3.4Gi，已用约 3.0Gi，可用约 447Mi
+Swap 2.0Gi
+```
+
+数据文件：
+
+```text
+data/runs.json          30M
+data/runs-summary.json  153K
+data/state.json         7.1K
+data/                  365M
+```
+
+最近单条 run 体积：
+
+```text
+Claude 429 failed: 约 19KB / 条
+Codex success:     约 105KB - 136KB / 条
+```
+
+### 问题原因
+
+1. `runs.json` 是大数组，每新增一条检测记录都要整文件读取、`JSON.parse`、重写，多个模型并发完成时会造成 CPU、内存和 IO 抖动。
+2. 捕获代理完整缓存上游响应后再返回给 CLI，不适合 SSE/streaming，响应越大内存越高。
+3. 前端详情页会对大对象执行 `JSON.stringify` 和树形渲染，请求头、响应头、转发头、转发体都可能造成浏览器卡顿。
+4. 默认并发 `3` 对当前服务器偏高。每个检测都会拉起真实 `codex` 或 `claude` CLI、独立代理和临时 workspace。
+5. `stdout/stderr`、请求体和响应体缺少更严格的 preview 限制。
+
+### 实施方案
+
+1. 日志存储改为：
+
+```text
+data/runs-summary.json          摘要列表，用于首页和日志列表
+data/runs/<run-id>.json         单条详情，点击详情时才读取
+data/runs.json                  仅作为旧数据迁移来源，不再作为主写入文件
+```
+
+2. 保存 run 时：
+
+```text
+写 data/runs/<id>.json
+只更新 runs-summary.json
+不再整文件读写 30M runs.json
+```
+
+3. 代理改为流式转发：
+
+```text
+上游 chunk 到达后立即 res.write 给 CLI
+只捕获前 N KB 作为日志 preview
+不完整缓存大响应体
+```
+
+4. 详情字段瘦身：
+
+```text
+保留：CLI 输入输出、请求体 preview、响应体 preview、forward_url
+删除前端展示：请求头、响应头、网关路由转发头、网关路由转发体
+不再保存 exchanges[] 和重复 logDetail
+```
+
+5. 限制大小：
+
+```text
+maxCapturedBodyChars = 50_000
+maxStoredTextChars = 50_000
+maxCliOutputChars = 50_000
+```
+
+6. 降低并发：
+
+```text
+默认 maxConcurrentChecks = 1
+前端上限 = 3
+后端上限 = 3
+```
+
+7. systemd 防护：
+
+```ini
+Environment=NODE_OPTIONS=--max-old-space-size=384
+MemoryHigh=600M
+MemoryMax=800M
+```
+
+8. README 更新：
+   - 说明日志新结构。
+   - 说明详情页只展示轻量字段。
+   - 说明多模型检测建议低并发。
+   - 说明 systemd 内存保护。
+
+### 验证
+
+本地：
+
+```bash
+node --check server/index.mjs
+npm run typecheck
+npm run build
+```
+
+服务器：
+
+```bash
+git pull --ff-only
+npm install
+systemctl daemon-reload
+systemctl restart model-detect
+curl http://127.0.0.1:20020/api/session
+```
+
+测试策略：
+
+```text
+不直接压测全部模型。
+先用 DeepSeek 单 Claude 模型、短 prompt 验证。
+再测试少量模型，确认不 OOM、不反复重写 runs.json。
+```

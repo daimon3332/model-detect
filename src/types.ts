@@ -147,13 +147,13 @@ export interface TestRun extends TestRunSummary {
   request: HttpExchange
   response: HttpExchange
   logDetail?: {
-    client_headers: unknown
-    client_body: unknown
+    client_headers?: unknown
+    client_body?: unknown
     forward_url: string
-    forward_headers: unknown
-    forward_body: unknown
-    provider_headers: unknown
-    provider_body: unknown
+    forward_headers?: unknown
+    forward_body?: unknown
+    provider_headers?: unknown
+    provider_body?: unknown
   }
   exchanges?: Array<{
     statusCode: number

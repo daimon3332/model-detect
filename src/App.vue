@@ -63,7 +63,7 @@ import type { AgentType, AppState, BackupImportJob, CheckJob, CheckTarget, Provi
 import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
-type DetailTab = 'cli' | 'request_headers' | 'request_body' | 'response_headers' | 'response_body' | 'forward_headers' | 'forward_body'
+type DetailTab = 'cli' | 'request_body' | 'response_body'
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object'
 
@@ -328,12 +328,8 @@ const openRunProvider = (run: TestRunSummary) => {
 
 const detailButtons: Array<{ key: DetailTab; label: string }> = [
   { key: 'cli', label: 'CLI 输入输出' },
-  { key: 'request_headers', label: '请求头' },
   { key: 'request_body', label: '请求体' },
-  { key: 'response_headers', label: '响应头' },
-  { key: 'response_body', label: '响应体' },
-  { key: 'forward_headers', label: '网关路由转发头' },
-  { key: 'forward_body', label: '网关路由转发体' }
+  { key: 'response_body', label: '响应体' }
 ]
 
 const detailContent = (run: TestRun) => {
@@ -345,12 +341,8 @@ const detailContent = (run: TestRun) => {
       `stderr:\n${run.stderr || ''}`,
       `exit code:\n${run.cliExitCode ?? ''}`
     ].join('\n\n'),
-    request_headers: detail?.client_headers ?? run.request.headers,
     request_body: detail?.client_body ?? run.request.body,
-    response_headers: detail?.provider_headers ?? run.response.headers,
-    response_body: detail?.provider_body ?? run.response.body,
-    forward_headers: detail?.forward_headers ?? {},
-    forward_body: detail?.forward_body ?? run.request.body
+    response_body: detail?.provider_body ?? run.response.body
   }
   return values[activeDetailTab.value]
 }
@@ -1015,7 +1007,7 @@ onMounted(boot)
               <el-input-number v-model="state.settings.logRetentionDays" :min="1" :max="365" />
             </el-form-item>
             <el-form-item label="最大并发检测数">
-              <el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="10" />
+              <el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="3" />
             </el-form-item>
             <el-form-item label="日志脱敏">
               <el-switch v-model="state.settings.redactLogs" />

@@ -1,7 +1,7 @@
 import { createServer, request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { extname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,11 +13,14 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const dataDir = resolve(process.env.MODEL_DETECT_DATA_DIR || join(root, 'data'))
 const stateFile = join(dataDir, 'state.json')
 const runsFile = join(dataDir, 'runs.json')
+const runsDir = join(dataDir, 'runs')
 const runsSummaryFile = join(dataDir, 'runs-summary.json')
 const port = Number(process.env.PORT || 5173)
 const schedulerMs = 30_000
-const maxCapturedBodyChars = 300_000
-const maxStoredTextChars = 120_000
+const maxCapturedBodyChars = 50_000
+const maxStoredTextChars = 50_000
+const maxCliOutputChars = 50_000
+const maxCapturedExchanges = 3
 const maxStoredRuns = 500
 const maxRunSummaries = 1000
 const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
@@ -88,7 +91,7 @@ const defaults = {
     scheduleHours: 0,
     scheduleMinutes: 30,
     proxyPort: 7788,
-    maxConcurrentChecks: 3,
+    maxConcurrentChecks: 1,
     logRetentionDays: 30,
     redactLogs: true,
     defaultCodexConfig,
@@ -110,6 +113,7 @@ const mime = {
 
 async function ensureData() {
   await mkdir(dataDir, { recursive: true })
+  await mkdir(runsDir, { recursive: true })
   try {
     await stat(stateFile)
   } catch {
@@ -120,13 +124,25 @@ async function ensureData() {
 
 async function migrateLegacyRuns() {
   try {
-    await stat(runsFile)
-    return
+    const existing = await readdir(runsDir)
+    if (existing.some((name) => name.endsWith('.json'))) return
   } catch {}
 
+  let legacyRuns = []
   try {
-    const parsed = JSON.parse(await readFile(stateFile, 'utf8'))
-    if (Array.isArray(parsed.runs) && parsed.runs.length) await saveRuns(parsed.runs)
+    legacyRuns = JSON.parse(await readFile(runsFile, 'utf8'))
+  } catch {
+    try {
+      const parsed = JSON.parse(await readFile(stateFile, 'utf8'))
+      legacyRuns = Array.isArray(parsed.runs) ? parsed.runs : []
+    } catch {}
+  }
+
+  if (!Array.isArray(legacyRuns) || !legacyRuns.length) return
+  await saveRuns(legacyRuns)
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    await rename(runsFile, join(dataDir, `runs-legacy-${stamp}.json`))
   } catch {}
 }
 
@@ -148,15 +164,16 @@ async function loadState(options = {}) {
 }
 
 async function loadRuns(fallbackState = null) {
-  await mkdir(dataDir, { recursive: true })
-  try {
-    const parsed = JSON.parse(await readFile(runsFile, 'utf8'))
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    const legacyRuns = Array.isArray(fallbackState?.runs) ? fallbackState.runs : []
-    if (legacyRuns.length) await saveRuns(legacyRuns)
-    return legacyRuns
+  const summaries = await loadRunSummaries(maxStoredRuns)
+  const runs = []
+  for (const summary of summaries) {
+    const run = await loadRunDetail(summary.id)
+    if (run) runs.push(run)
   }
+  if (runs.length) return runs
+  const legacyRuns = Array.isArray(fallbackState?.runs) ? fallbackState.runs : []
+  if (legacyRuns.length) await saveRuns(legacyRuns)
+  return legacyRuns
 }
 
 async function loadRunSummaries(limit = maxRunSummaries) {
@@ -165,7 +182,7 @@ async function loadRunSummaries(limit = maxRunSummaries) {
     const parsed = JSON.parse(await readFile(runsSummaryFile, 'utf8'))
     return Array.isArray(parsed) ? parsed.slice(0, limit) : []
   } catch {
-    const runs = await loadRuns()
+    const runs = await loadLegacyRuns()
     const summaries = runs.slice(0, limit).map(publicRunSummary)
     await saveRunSummaries(summaries)
     return summaries
@@ -194,7 +211,7 @@ function normalizeSettings(settings = {}) {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
-  merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
+  merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
   merged.defaultClaudeSettings = String(merged.defaultClaudeSettings || defaultClaudeSettings)
   merged.codexInstruction = normalizeTextFileContent(settings.codexInstruction, defaultCodexInstruction)
@@ -238,9 +255,11 @@ async function saveState(state) {
 }
 
 async function saveRuns(runs) {
-  await mkdir(dataDir, { recursive: true })
+  await mkdir(runsDir, { recursive: true })
   const limited = runs.slice(0, maxStoredRuns).map(pruneRunForStorage)
-  await writeFile(runsFile, JSON.stringify(limited, null, 2))
+  await rm(runsDir, { recursive: true, force: true })
+  await mkdir(runsDir, { recursive: true })
+  for (const run of limited) await saveRunDetail(run)
   await saveRunSummaries(limited.slice(0, maxRunSummaries).map(publicRunSummary))
 }
 
@@ -250,8 +269,61 @@ async function saveRunSummaries(summaries) {
 }
 
 function pruneRunForStorage(run) {
-  const { exchanges, ...singleExchangeRun } = run
-  return pruneLargeText(singleExchangeRun)
+  const { exchanges, logDetail, ...singleExchangeRun } = run
+  const slim = {
+    ...singleExchangeRun,
+    request: {
+      method: run.request?.method,
+      url: run.request?.url,
+      targetUrl: run.request?.targetUrl || logDetail?.forward_url,
+      headers: {},
+      body: run.request?.body ?? logDetail?.client_body
+    },
+    response: {
+      headers: {},
+      body: run.response?.body ?? logDetail?.provider_body
+    }
+  }
+  return pruneLargeText(slim)
+}
+
+function runDetailPath(id) {
+  return join(runsDir, `${safeId(id)}.json`)
+}
+
+async function saveRunDetail(run) {
+  await mkdir(runsDir, { recursive: true })
+  const detail = pruneRunForStorage(run)
+  await writeFile(runDetailPath(detail.id), JSON.stringify(detail, null, 2))
+}
+
+async function loadRunDetail(id) {
+  try {
+    return JSON.parse(await readFile(runDetailPath(id), 'utf8'))
+  } catch {}
+  const legacy = await loadLegacyRuns()
+  return legacy.find((run) => run.id === id) || null
+}
+
+async function loadLegacyRuns() {
+  try {
+    const parsed = JSON.parse(await readFile(runsFile, 'utf8'))
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+async function updateRunSummaries(mutator) {
+  const next = stateWriteQueue.then(async () => {
+    const summaries = await loadRunSummaries()
+    const result = await mutator(summaries)
+    const finalSummaries = result || summaries
+    await saveRunSummaries(finalSummaries)
+    return finalSummaries
+  })
+  stateWriteQueue = next.catch(() => undefined)
+  return next
 }
 
 function pruneLargeText(value) {
@@ -421,7 +493,7 @@ async function upsertProvider(provider) {
 
 async function deleteProvider(id) {
   await rm(join(dataDir, 'providers', safeId(id)), { recursive: true, force: true })
-  await updateRuns((runs) => runs.filter((item) => item.providerId !== id))
+  await removeRunRecords({ providerId: id })
   return updateState((current) => {
     current.providers = current.providers.filter((item) => item.id !== id)
     return current
@@ -446,17 +518,7 @@ async function clearRuns(target = {}) {
   const providerId = target.providerId || ''
   const agent = target.agent || ''
   const modelName = target.modelName || ''
-  const nextRuns = await updateRuns((runs) => {
-    if (!providerId) {
-      return []
-    }
-
-    return runs.filter((run) => {
-      if (run.providerId !== providerId) return true
-      if (!agent || !modelName) return false
-      return !(run.agent === agent && run.model === modelName)
-    })
-  })
+  const nextRuns = await removeRunRecords({ providerId, agent, modelName })
 
   const state = await updateState((state) => {
     if (!providerId) {
@@ -481,6 +543,28 @@ async function clearRuns(target = {}) {
     return state
   })
   return state
+}
+
+async function removeRunRecords(target = {}) {
+  const providerId = target.providerId || ''
+  const agent = target.agent || ''
+  const modelName = target.modelName || ''
+  const removed = []
+  const nextSummaries = await updateRunSummaries((summaries) => {
+    const kept = summaries.filter((run) => {
+      const matched = !providerId
+        || (run.providerId === providerId && (!agent || !modelName || (run.agent === agent && run.model === modelName)))
+      if (matched) removed.push(run.id)
+      return !matched
+    })
+    return kept
+  })
+  for (const id of removed) await rm(runDetailPath(id), { force: true })
+  if (!providerId) {
+    await rm(runsDir, { recursive: true, force: true })
+    await mkdir(runsDir, { recursive: true })
+  }
+  return nextSummaries
 }
 
 async function updateScheduleSettings(body = {}) {
@@ -780,9 +864,7 @@ async function createCaptureProxy(capture) {
 
 async function proxyRequest(req, res, context) {
   const started = Date.now()
-  const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
-  const requestBodyBuffer = Buffer.concat(chunks)
+  const requestBodyBuffer = await readProxyRequestBody(req)
   const requestHeaders = normalizeHeaders(req.headers)
   const targetUrl = buildTargetUrl(context, req.url)
   const outboundHeaders = { ...requestHeaders, 'accept-encoding': 'identity' }
@@ -791,23 +873,42 @@ async function proxyRequest(req, res, context) {
   delete outboundHeaders['content-length']
   applyProviderAuthHeaders(outboundHeaders, context)
 
+  let responseHeaders = {}
+  let responseStarted = false
   const upstream = await requestUpstream(
     targetUrl,
     req.method,
     outboundHeaders,
     ['GET', 'HEAD'].includes(req.method) ? undefined : requestBodyBuffer,
     context.proxyUrl,
-    context.timeoutMs
+    context.timeoutMs,
+    {
+      onResponse: (statusCode, headers) => {
+        responseHeaders = normalizeHeaders(headers)
+        for (const [key, value] of Object.entries(responseHeaders)) {
+          if (!['connection', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
+            res.setHeader(key, value)
+          }
+        }
+        res.writeHead(statusCode)
+        responseStarted = true
+      },
+      onData: (chunk) => {
+        res.write(chunk)
+      }
+    }
   )
 
-  const responseHeaders = normalizeHeaders(upstream.headers)
-  for (const [key, value] of Object.entries(responseHeaders)) {
-    if (!['connection', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
-      res.setHeader(key, value)
+  if (!responseStarted) {
+    responseHeaders = normalizeHeaders(upstream.headers)
+    for (const [key, value] of Object.entries(responseHeaders)) {
+      if (!['connection', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
+        res.setHeader(key, value)
+      }
     }
+    res.writeHead(upstream.statusCode)
+    res.write(upstream.body)
   }
-  res.writeHead(upstream.statusCode)
-  res.write(upstream.body)
   res.end()
 
   const responseBodyBuffer = upstream.body
@@ -819,16 +920,13 @@ async function proxyRequest(req, res, context) {
     client: {
       method: req.method,
       path: req.url,
-      headers: requestHeaders,
       body: clientBody
     },
     forward: {
       url: targetUrl,
-      headers: outboundHeaders,
       body: clientBody
     },
     provider: {
-      headers: responseHeaders,
       body: providerBody
     }
   }
@@ -838,18 +936,30 @@ async function proxyRequest(req, res, context) {
       method: req.method,
       url: req.url,
       targetUrl,
-      headers: requestHeaders,
+      headers: {},
       body: clientBody
     },
     response: {
-      headers: responseHeaders,
+      headers: {},
       body: providerBody
     },
     logDetail: toLogDetail(exchange)
   })
+  if (context.exchanges.length > maxCapturedExchanges) context.exchanges.splice(0, context.exchanges.length - maxCapturedExchanges)
 }
 
-function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeoutMs = 90_000) {
+async function readProxyRequestBody(req) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > 1_000_000) throw new Error('proxy_request_too_large')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeoutMs = 90_000, hooks = {}) {
   const target = new URL(targetUrl)
   const client = target.protocol === 'https:' ? httpsRequest : httpRequest
   const agent = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
@@ -861,9 +971,22 @@ function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeou
       resolve(value)
     }
     const upstreamReq = client(target, { method, headers, agent }, (upstreamRes) => {
+      hooks.onResponse?.(upstreamRes.statusCode || 502, upstreamRes.headers)
       const chunks = []
-      upstreamRes.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      let captured = 0
+      let truncated = 0
+      upstreamRes.on('data', (chunk) => {
+        hooks.onData?.(chunk)
+        const remaining = maxCapturedBodyChars - captured
+        if (remaining > 0) {
+          const part = Buffer.from(chunk.slice(0, remaining))
+          chunks.push(part)
+          captured += part.length
+        }
+        if (chunk.length > remaining) truncated += chunk.length - Math.max(0, remaining)
+      })
       upstreamRes.on('end', () => {
+        if (truncated > 0) chunks.push(Buffer.from(`\n...[truncated ${truncated} bytes]`))
         finish({
           statusCode: upstreamRes.statusCode || 502,
           headers: upstreamRes.headers,
@@ -976,12 +1099,8 @@ function selectExchange(exchanges) {
 
 function toLogDetail(exchange) {
   return {
-    client_headers: exchange.client.headers,
     client_body: exchange.client.body,
     forward_url: exchange.forward.url,
-    forward_headers: exchange.forward.headers,
-    forward_body: exchange.forward.body,
-    provider_headers: exchange.provider.headers,
     provider_body: exchange.provider.body
   }
 }
@@ -1153,7 +1272,7 @@ async function runChecks(target = {}, scheduled = false, job = null) {
     message: targets.length ? `准备检测 ${targets.length} 个模型` : '没有可检测的模型'
   })
 
-  const maxConcurrent = state.settings.maxConcurrentChecks || 3
+  const maxConcurrent = state.settings.maxConcurrentChecks || 1
   await Promise.all(targets.map(({ provider, model }) =>
     runWithCheckSlot(maxConcurrent, async () => {
       const itemId = `${provider.id}:${model.agent}:${model.name}`
@@ -1198,7 +1317,17 @@ async function runChecks(target = {}, scheduled = false, job = null) {
 }
 
 async function saveRun(run, scheduled = false) {
-  await updateRuns((runs) => [run, ...runs].slice(0, maxStoredRuns))
+  await saveRunDetail(run)
+  let dropped = []
+  await updateRunSummaries((summaries) => {
+    const merged = [
+      publicRunSummary(run),
+      ...summaries.filter((item) => item.id !== run.id)
+    ]
+    dropped = merged.slice(maxStoredRuns).map((item) => item.id)
+    return merged.slice(0, maxStoredRuns)
+  })
+  for (const id of dropped) await rm(runDetailPath(id), { force: true })
   return updateState((current) => {
     const intervalMs = scheduleIntervalMs(current.settings)
     const provider = current.providers.find((item) => item.id === run.providerId)
@@ -1313,12 +1442,8 @@ async function runOne(state, provider, model) {
   const latencyMs = Date.now() - started
   const exchange = selectExchange(capture.exchanges)
   const logDetail = exchange?.logDetail ?? {
-    client_headers: buildRequest(runtimeProvider, model, prompt).headers,
     client_body: buildRequest(runtimeProvider, model, prompt).body,
     forward_url: runtimeBaseUrl,
-    forward_headers: {},
-    forward_body: provider.saveBody ? { model: model.name, prompt } : '[body disabled]',
-    provider_headers: { 'x-cli-exit-code': String(result.exitCode ?? ''), 'x-cli-agent': model.agent },
     provider_body: provider.saveBody ? { stdout: result.stdout, stderr: result.stderr, note: 'no proxy exchange captured' } : '[body disabled]'
   }
   const hasText = result.stdout.trim().length > 0
@@ -1353,11 +1478,10 @@ async function runOne(state, provider, model) {
     errorMessage,
     request: exchange?.request ?? buildRequest(runtimeProvider, model, prompt),
     response: exchange?.response ?? {
-      headers: { 'x-cli-exit-code': String(result.exitCode ?? ''), 'x-cli-agent': model.agent },
+      headers: {},
       body: provider.saveBody ? { stdout: result.stdout, stderr: result.stderr, note: 'no proxy exchange captured' } : '[body disabled]'
     },
-    logDetail,
-    exchanges: capture.exchanges
+    logDetail
   }
 }
 
@@ -1409,8 +1533,8 @@ function execProcess(cmd, args, options) {
       child.kill('SIGTERM')
       resolve({ exitCode: null, stdout, stderr, timedOut: true })
     }, options.timeoutMs)
-    child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
+    child.stdout.on('data', (chunk) => { stdout = appendLimitedOutput(stdout, chunk) })
+    child.stderr.on('data', (chunk) => { stderr = appendLimitedOutput(stderr, chunk) })
     child.on('error', (error) => {
       if (done) return
       done = true
@@ -1424,6 +1548,13 @@ function execProcess(cmd, args, options) {
       resolve({ exitCode: code ?? 0, stdout, stderr, timedOut: false })
     })
   })
+}
+
+function appendLimitedOutput(current, chunk) {
+  if (current.includes('[truncated cli output]')) return current
+  const next = `${current}${chunk.toString()}`
+  if (next.length <= maxCliOutputChars) return next
+  return `${next.slice(0, maxCliOutputChars)}\n...[truncated cli output]`
 }
 
 async function scheduleTick() {
@@ -1495,8 +1626,7 @@ async function handleApi(req, res, pathname) {
   }
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/)
   if (req.method === 'GET' && runMatch) {
-    const runs = await loadRuns()
-    const run = runs.find((item) => item.id === runMatch[1])
+    const run = await loadRunDetail(runMatch[1])
     if (!run) return send(res, 404, { error: 'run_not_found' })
     return send(res, 200, run)
   }

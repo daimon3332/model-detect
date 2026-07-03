@@ -8,9 +8,12 @@ Type=simple
 WorkingDirectory=/root/model-detect
 Environment=PORT=20020
 Environment=PATH=/root/.nvm/versions/node/v24.16.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_OPTIONS=--max-old-space-size=384
 ExecStart=/root/.nvm/versions/node/v24.16.0/bin/npm run server
 Restart=always
 RestartSec=3
+MemoryHigh=600M
+MemoryMax=800M
 KillSignal=SIGTERM
 TimeoutStopSec=20
 StandardOutput=append:/root/model-detect/server.log

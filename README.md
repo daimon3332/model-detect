@@ -150,6 +150,16 @@ Environment=PATH=...
 ExecStart=...
 ```
 
+模板内置资源保护：
+
+```text
+Environment=NODE_OPTIONS=--max-old-space-size=384
+MemoryHigh=600M
+MemoryMax=800M
+```
+
+这会限制 model-detect 自身内存，尽量避免多模型检测时拖垮整台服务器。
+
 常用命令：
 
 ```bash
@@ -167,13 +177,14 @@ systemd 服务仍会把应用日志追加写入：
 /root/model-detect/server.log
 ```
 
-检测记录采用轻量化保存策略，避免 `runs.json` 过大导致 Node 被 OOM Killer 杀掉：
+检测记录采用轻量化保存策略，避免单个 `runs.json` 过大导致 Node 被 OOM Killer 杀掉：
 
 ```text
-data/runs.json          最多保留最近 500 条详情
-data/runs-summary.json  最多保留最近 1000 条摘要，首页和日志列表优先读取它
-单个大文本字段保存前会截断，避免单条请求/响应 body 撑爆内存
-详情持久化只保留选中的主请求/响应和 logDetail，不再保存 exchanges 的重复副本
+data/runs-summary.json  最多保留最近 500 条摘要，首页和日志列表读取它
+data/runs/<run-id>.json 每条检测详情单独保存，点击详情时才读取
+data/runs.json          仅作为旧数据迁移来源，不再作为主写入文件
+请求体、响应体、stdout、stderr 都只保存 preview，避免大 body 撑爆内存
+详情持久化不再保存 headers、forward body、exchanges[]、重复 logDetail
 ```
 
 更新代码后使用：
@@ -355,7 +366,7 @@ Nginx / Cloudflare -> 127.0.0.1:20020
 4. 每个提供商使用独立 CLI 配置目录，不污染用户级配置。
 5. 支持手动检测和定时检测。
 6. 检测时调用真实 Codex CLI / Claude Code CLI。
-7. 记录真实 CLI 请求头、请求体、响应头、响应体。
+7. 记录真实 CLI 请求体和上游响应体 preview；默认不持久化 headers。
 8. 首页按 provider / agent / model 展示最近 10 次检测结果。
 
 ## 当前功能
@@ -469,9 +480,9 @@ Claude Code 默认使用更短的检测提示词，减少无意义回复长度�
 
 ## 参考 CCG Gateway 的日志模板
 
-本项目的日志采集参考 `ccg-gateway` 的三段式结构。前端详情页按按钮展示七项：CLI 输入输出、请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
+本项目的日志采集参考 `ccg-gateway` 的三段式结构，但为了避免多模型检测时前端和后端卡死，默认只保留轻量 preview。
 
-内部仍然采集三段数据，便于后续排查：
+内部请求链路仍然是三段：
 
 ```text
 client  = Agent 请求，也就是 CLI 发到本地代理的原始请求
@@ -483,20 +494,16 @@ provider = 服务商响应，也就是真实 provider 返回给代理的响应
 
 ```text
 CLI 输入输出 = prompt + stdout + stderr + cliExitCode
-请求头 = client_headers
-请求体 = client_body
-响应头 = provider_headers
-响应体 = provider_body
-网关路由转发头 = forward_headers
-网关路由转发体 = forward_body
+请求体 = CLI 请求 body preview
+响应体 = provider 响应 body preview
 ```
 
-`forward_url` 和 `exchanges[]` 仍保存在日志数据中，用于后续高级诊断；当前详情页不再展示 `全部交换`、`原始 JSON` 入口。
+详情数据中保留 `request.targetUrl` 便于确认最终上游地址；默认不再保存 headers、forward body、`exchanges[]` 和重复 `logDetail`。
 
 详情页展示策略：
 
-- 前端不再做 32K 字符截断，展示后端保存的完整字段内容。
-- 如果后端因为日志体积限制截断，会在内容中出现 `[truncated ... chars]`。
+- 前端展示后端保存的 preview。
+- 如果后端因为日志体积限制截断，会在内容中出现 `[truncated ...]`。
 - JSON object / array 使用可折叠树展示，并默认展开。
 - 合法 JSON 字符串会自动解析为可折叠树。
 - 普通字符串 body 按原始文本展示，不再用 `JSON.stringify` 包一层。
@@ -505,56 +512,33 @@ CLI 输入输出 = prompt + stdout + stderr + cliExitCode
 
 ### 1. Agent 请求
 
-CLI 发到本地代理的原始请求。
-
-字段：
+CLI 发到本地代理的原始请求。当前默认只保存请求体 preview：
 
 ```text
-client_headers
-client_body
+request.body
 ```
 
-这里应该能看到 Codex / Claude Code 自己带的真实请求头。比如 Codex 可能包含：
-
-```text
-session-id
-x-codex-beta-features
-x-codex-window-id
-x-client-request-id
-x-codex-turn-metadata
-originator
-user-agent
-authorization
-accept
-content-type
-```
+请求头不再进入详情持久化，避免大量 header、token、beta 字段和重复数据撑大日志。
 
 ### 2. 网关路由转发
 
-本地代理转发给真实上游 provider 的请求。
-
-字段：
+本地代理转发给真实上游 provider 的请求。当前默认只保留最终地址：
 
 ```text
-forward_url
-forward_headers
-forward_body
+request.targetUrl
 ```
 
-这里是代理实际转发到上游 provider 的内容，当前前端详情页通过“网关路由转发头 / 网关路由转发体”按钮展示。
+`forward_headers` 和 `forward_body` 不再进入详情持久化，前端也不再展示网关路由转发头/转发体。
 
 ### 3. 服务商响应
 
-真实 provider 返回给本地代理的响应。
-
-字段：
+真实 provider 返回给本地代理的响应。当前默认只保存响应体 preview：
 
 ```text
-provider_headers
-provider_body
+response.body
 ```
 
-这里展示真实上游的响应头和响应体。
+响应头不再进入详情持久化。
 
 ### CLI 信息
 
@@ -994,18 +978,19 @@ done: 是否结束
 
 ### `GET /api/runs/:id`
 
-返回单条检测记录完整详情，包括：
+返回单条检测记录轻量详情，包括：
 
 ```text
 prompt
-stdout
-stderr
+stdout preview
+stderr preview
 cliExitCode
-请求头 / 请求体
-响应头 / 响应体
-网关路由转发头 / 转发体
-exchanges[]
+request.body preview
+response.body preview
+request.targetUrl
 ```
+
+不再返回 headers、forward body、exchanges[]。
 
 前端只有点击某条状态码或日志详情时才请求这个接口。
 
@@ -1187,18 +1172,15 @@ Claude Code 默认模板包含低输出检测相关环境变量：
   "httpStatus": 200,
   "cliExitCode": 0,
   "latencyMs": 1234,
-  "stdout": "...",
-  "stderr": "...",
-  "logDetail": {
-    "client_headers": {},
-    "client_body": {},
-    "forward_url": "https://upstream.example/v1/responses",
-    "forward_headers": {},
-    "forward_body": {},
-    "provider_headers": {},
-    "provider_body": {}
+  "stdout": "...preview...",
+  "stderr": "...preview...",
+  "request": {
+    "targetUrl": "https://upstream.example/v1/responses",
+    "body": {}
   },
-  "exchanges": []
+  "response": {
+    "body": {}
+  }
 }
 ```
 
@@ -1234,19 +1216,13 @@ httpStatus: 200
 
 ```text
 CLI 输入输出
-请求头
 请求体
-响应头
 响应体
-网关路由转发头
-网关路由转发体
 ```
 
 默认打开 `CLI 输入输出`，展示 prompt、stdout、stderr 和 cliExitCode。
 
-当前按钮内容都支持“复制当前内容”。JSON 内容默认展开，便于直接查看请求头、请求体、响应头、响应体和网关转发内容。
-
-`全部交换`、`原始 JSON` 不再作为详情页主入口展示。
+当前按钮内容都支持“复制当前内容”。JSON 内容默认展开。请求头、响应头、网关路由转发头、网关路由转发体、`全部交换`、`原始 JSON` 不再作为详情页入口展示。
 
 ## Linux 测试约束
 
@@ -1270,7 +1246,7 @@ hello
 
 - 目前使用 JSON 文件保存配置和检测记录，后续可换 SQLite。
 - 当前代理不做 HTTPS MITM，只支持 CLI base_url 指向本地 HTTP 代理。
-- 前端当前不展示 `exchanges[]`，详情页展示 CLI 输入输出、请求头、请求体、响应头、响应体、网关路由转发头、网关路由转发体。
+- 前端当前不展示 `exchanges[]`，详情页只展示 CLI 输入输出、请求体、响应体。
 - 日志体大小当前在后端截断，后续可做配置项。
 
 ## 后续计划
@@ -1399,13 +1375,8 @@ crypto.randomUUID 可用时使用 crypto.randomUUID
 
 ### Claude Code 鉴权头和 Timeout 展示
 
-日志详情中：
+Claude Code 检测时，代理会用当前 provider 的 API Key 覆盖转发请求里的 `authorization` 和 `x-api-key`，避免旧环境变量或 CLI 默认值污染上游鉴权。
 
-```text
-client_headers  = CLI 原始请求头
-forward_headers = 实际转发给上游的请求头
-```
-
-Claude Code 检测时，代理会用当前 provider 的 API Key 覆盖 `authorization` 和 `x-api-key`，避免旧环境变量或 CLI 默认值污染上游鉴权。
+为降低日志体积，headers 默认不再进入详情持久化；如需排查鉴权问题，以服务端临时调试日志或上游错误体为准。
 
 如果 CLI 进程超时，但代理已经捕获到上游 HTTP 响应，页面优先显示上游 HTTP 状态码和错误信息；只有完全没有捕获到上游响应时才显示 Timeout。

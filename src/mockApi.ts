@@ -15,7 +15,7 @@ const defaultSettings: GlobalSettings = {
   scheduleHours: 0,
   scheduleMinutes: 30,
   proxyPort: 7788,
-  maxConcurrentChecks: 3,
+  maxConcurrentChecks: 1,
   logRetentionDays: 30,
   redactLogs: true,
   defaultCodexConfig: '',
@@ -88,7 +88,7 @@ function normalizeSettings(settings?: Partial<GlobalSettings>): GlobalSettings {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
-  merged.maxConcurrentChecks = Math.min(10, Math.max(1, Number(merged.maxConcurrentChecks || 3)))
+  merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = ensureTomlSetting(String(merged.defaultCodexConfig || defaultCodexConfig), 'model_verbosity', '"low"')
   merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_effort', '"low"')
   merged.defaultCodexConfig = ensureTomlSetting(merged.defaultCodexConfig, 'model_reasoning_summary', '"none"')
