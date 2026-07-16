@@ -57,6 +57,7 @@ import {
   saveProviderApi,
   saveScheduleSettingsApi,
   saveSettingsApi,
+  updateCliApi,
   startChecksApi
 } from './api'
 import type { AgentType, AppState, BackupImportJob, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun, TestRunSummary } from './types'
@@ -142,6 +143,7 @@ const backupFileInput = ref<HTMLInputElement | null>(null)
 const backupImportDialog = ref(false)
 const backupImportJob = ref<BackupImportJob | null>(null)
 const scheduleSaving = reactive<Record<string, boolean>>({})
+const updateLoading = reactive<Record<string, boolean>>({ codex: false, claude: false })
 
 const filters = reactive({
   providerId: 'all',
@@ -443,6 +445,16 @@ const saveSettings = async () => {
   } catch (error) {
     handleApiError(error, '保存设置失败')
   }
+}
+
+const updateCli = async (target: AgentType) => {
+  updateLoading[target] = true
+  try {
+    const result = await updateCliApi(state, target)
+    if (result?.ok) ElMessage.success(`${target === 'codex' ? 'Codex' : 'Claude Code'} 更新完成`)
+    else ElMessage.error(result?.output || '更新失败')
+  } catch (error) { handleApiError(error, '更新失败') }
+  finally { updateLoading[target] = false }
 }
 
 const resetAllProviderConfig = async (target: AgentType) => {
@@ -1001,6 +1013,12 @@ onMounted(boot)
             <input ref="backupFileInput" type="file" accept="application/json" class="hidden-file-input" @change="importBackupFile" />
           </div>
           <el-form label-position="top">
+            <el-form-item label="CLI 自动更新">
+              <el-switch v-model="state.settings.autoUpdateEnabled" active-text="启用" />
+              <el-input-number v-model="state.settings.autoUpdateIntervalDays" :min="1" :max="365" />
+              <el-button :loading="updateLoading.codex" @click="updateCli('codex')">更新 Codex</el-button>
+              <el-button :loading="updateLoading.claude" @click="updateCli('claude')">更新 Claude Code</el-button>
+            </el-form-item>
             <el-form-item label="Codex 命令">
               <el-input v-model="state.settings.codexCommand" />
             </el-form-item>

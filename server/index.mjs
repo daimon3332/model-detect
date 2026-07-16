@@ -99,6 +99,8 @@ const defaults = {
     defaultCodexConfig,
     defaultClaudeSettings,
     codexInstruction: defaultCodexInstruction,
+    autoUpdateEnabled: true,
+    autoUpdateIntervalDays: 4,
     adminPassword: 'admin'
   }
 }
@@ -214,6 +216,8 @@ function normalizeSettings(settings = {}) {
   merged.scheduleDays = Number(merged.scheduleDays || 0)
   merged.scheduleHours = Number(merged.scheduleHours || 0)
   merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.autoUpdateEnabled = merged.autoUpdateEnabled !== false
+  merged.autoUpdateIntervalDays = Math.max(1, Number(merged.autoUpdateIntervalDays || 4))
   merged.defaultTimeoutSeconds = Math.min(600, Math.max(5, Number(merged.defaultTimeoutSeconds || defaultTimeoutSeconds)))
   merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
@@ -352,6 +356,20 @@ async function updateState(mutator) {
   })
   stateWriteQueue = next.catch(() => undefined)
   return next
+}
+
+async function runCliUpdate(target) {
+  const args = target === 'codex'
+    ? ['install', '-g', '@openai/codex', '--registry=https://registry.npmjs.org/']
+    : ['install', '-g', '@anthropic-ai/claude-code@latest', '--registry=https://registry.npmjs.org/']
+  return await new Promise((resolve, reject) => {
+    const child = spawn('npm', args, { shell: true, windowsHide: true })
+    let output = ''
+    child.stdout.on('data', (chunk) => { output += chunk.toString() })
+    child.stderr.on('data', (chunk) => { output += chunk.toString() })
+    child.on('error', reject)
+    child.on('close', (code) => resolve({ ok: code === 0, output: output.slice(-5000) }))
+  })
 }
 
 async function updateRuns(mutator) {
@@ -1570,6 +1588,20 @@ async function scheduleTick() {
   scheduleRunning = true
   try {
   const state = await loadState({ includeRuns: false })
+  if (state.settings.autoUpdateEnabled) {
+    const now = Date.now()
+    for (const target of ['codex', 'claude']) {
+      const field = target === 'codex' ? 'codexLastUpdateAt' : 'claudeLastUpdateAt'
+      const last = state.settings[field] ? new Date(state.settings[field]).getTime() : 0
+      if (!last || now - last >= state.settings.autoUpdateIntervalDays * 86400000) {
+        try {
+          const result = await runCliUpdate(target)
+          await updateState((current) => { current.settings[field] = new Date().toISOString(); return current })
+          if (!result.ok) console.error(`${target} update failed: ${result.output}`)
+        } catch (error) { console.error(`${target} update error: ${error.message}`) }
+      }
+    }
+  }
   if (!state.settings.scheduleEnabled) return
   const now = Date.now()
   const due = state.providers.filter((provider) => {
@@ -1669,6 +1701,17 @@ async function handleApi(req, res, pathname) {
     })
     if (hasCodexInstructionFile(state.settings.defaultCodexConfig)) await ensureCodexInstructionFile(state.settings)
     return send(res, 200, publicState(state, { includeRuns: false }))
+  }
+  if (req.method === 'POST' && pathname === '/api/updates') {
+    const body = await readJson(req)
+    if (!['codex', 'claude'].includes(body.target)) return send(res, 400, { error: 'invalid_target' })
+    const result = await runCliUpdate(body.target)
+    const field = body.target === 'codex' ? 'codexLastUpdateAt' : 'claudeLastUpdateAt'
+    const state = await updateState((current) => {
+      current.settings[field] = new Date().toISOString()
+      return current
+    })
+    return send(res, result.ok ? 200 : 500, { ...publicState(state, { includeRuns: false }), update: { target: body.target, ...result } })
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)

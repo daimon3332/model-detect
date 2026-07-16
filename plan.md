@@ -1120,3 +1120,11 @@ node --check server/index.mjs
 npm run typecheck
 npm run build
 ```
+
+# Codex / Claude Code 更新功能实施计划
+
+1. 扩展 GlobalSettings，增加自动更新开关、间隔天数和最近更新时间字段。
+2. 增加服务端 POST /api/updates 接口，执行 npm 更新命令并记录结果。
+3. 增加全局设置页面的自动更新配置、手动更新按钮和状态展示。
+4. 增加前端 API 与交互状态处理。
+5. 执行构建和语法验证。

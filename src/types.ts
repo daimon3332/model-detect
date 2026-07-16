@@ -52,6 +52,10 @@ export interface GlobalSettings {
   defaultClaudeSettings: string
   codexInstruction: string
   adminPassword?: string
+  autoUpdateEnabled: boolean
+  autoUpdateIntervalDays: number
+  codexLastUpdateAt?: string
+  claudeLastUpdateAt?: string
 }
 
 export interface CheckTarget {

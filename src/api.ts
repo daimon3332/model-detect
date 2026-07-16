@@ -68,6 +68,12 @@ export async function saveSettingsApi(state: AppState, extra: Partial<GlobalSett
   assignState(state, next)
 }
 
+export async function updateCliApi(state: AppState, target: AgentType) {
+  const next = await api<AppState & { update?: { target: AgentType; ok: boolean; output: string } }>('/api/updates', { method: 'POST', body: { target } })
+  assignState(state, next)
+  return next.update
+}
+
 export async function saveScheduleSettingsApi(
   state: AppState,
   body: Pick<GlobalSettings, 'scheduleEnabled' | 'scheduleDays' | 'scheduleHours' | 'scheduleMinutes'>

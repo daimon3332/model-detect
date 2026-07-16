@@ -21,7 +21,9 @@ const defaultSettings: GlobalSettings = {
   redactLogs: true,
   defaultCodexConfig: '',
   defaultClaudeSettings: '',
-  codexInstruction: defaultCodexInstruction
+  codexInstruction: defaultCodexInstruction,
+  autoUpdateEnabled: true,
+  autoUpdateIntervalDays: 4
 }
 
 const defaultCodexConfig = `model_reasoning_summary = "none"
