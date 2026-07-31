@@ -74,6 +74,7 @@ const sessions = new Set()
 const jobs = new Map()
 const backupJobs = new Map()
 const cliUpdatePromises = new Map()
+const activeTargetChecks = new Map()
 let stateWriteQueue = Promise.resolve()
 let scheduleRunning = false
 let updateRunning = false
@@ -912,23 +913,48 @@ function promptFor(settings, provider, model) {
 }
 
 async function createCaptureProxy(capture) {
+  const sockets = new Set()
+  let closed = false
   const server = createServer((req, res) => {
+    if (capture.signal?.aborted) {
+      res.destroy()
+      return
+    }
     proxyRequest(req, res, capture).catch((error) => {
+      if (isCheckCancelled(error) || capture.signal?.aborted || res.destroyed) return
+      if (res.headersSent) {
+        res.destroy()
+        return
+      }
       res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ error: error.message }))
     })
   })
+  server.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
+  const close = () => {
+    if (closed) return Promise.resolve()
+    closed = true
+    capture.signal?.removeEventListener('abort', close)
+    for (const socket of sockets) socket.destroy()
+    return new Promise((resolve) => server.close(() => resolve()))
+  }
+  capture.signal?.addEventListener('abort', close, { once: true })
   return {
     port: typeof address === 'object' && address ? address.port : 0,
-    close: () => new Promise((resolve) => server.close(resolve))
+    close
   }
 }
 
 async function proxyRequest(req, res, context) {
+  throwIfCheckCancelled(context.signal)
   const started = Date.now()
-  const requestBodyBuffer = await readProxyRequestBody(req)
+  const requestBodyBuffer = await readProxyRequestBody(req, context.signal)
+  throwIfCheckCancelled(context.signal)
   const requestHeaders = normalizeHeaders(req.headers)
   const targetUrl = buildTargetUrl(context, req.url)
   const outboundHeaders = { ...requestHeaders, 'accept-encoding': 'identity' }
@@ -948,6 +974,7 @@ async function proxyRequest(req, res, context) {
     context.timeoutMs,
     {
       onResponse: (statusCode, headers) => {
+        if (context.signal?.aborted || res.destroyed) return
         responseHeaders = normalizeHeaders(headers)
         for (const [key, value] of Object.entries(responseHeaders)) {
           if (!['connection', 'content-length', 'transfer-encoding'].includes(key.toLowerCase())) {
@@ -958,10 +985,12 @@ async function proxyRequest(req, res, context) {
         responseStarted = true
       },
       onData: (chunk) => {
-        res.write(chunk)
+        if (!context.signal?.aborted && !res.destroyed) res.write(chunk)
       }
-    }
+    },
+    context.signal
   )
+  throwIfCheckCancelled(context.signal)
 
   if (!responseStarted) {
     responseHeaders = normalizeHeaders(upstream.headers)
@@ -1012,10 +1041,11 @@ async function proxyRequest(req, res, context) {
   if (context.exchanges.length > maxCapturedExchanges) context.exchanges.splice(0, context.exchanges.length - maxCapturedExchanges)
 }
 
-async function readProxyRequestBody(req) {
+async function readProxyRequestBody(req, signal) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
+    throwIfCheckCancelled(signal)
     size += chunk.length
     if (size > 1_000_000) throw new Error('proxy_request_too_large')
     chunks.push(chunk)
@@ -1023,18 +1053,40 @@ async function readProxyRequestBody(req) {
   return Buffer.concat(chunks)
 }
 
-function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeoutMs = 90_000, hooks = {}) {
+function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeoutMs = 90_000, hooks = {}, signal) {
+  throwIfCheckCancelled(signal)
   const target = new URL(targetUrl)
   const client = target.protocol === 'https:' ? httpsRequest : httpRequest
   const agent = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false
-    const finish = (value) => {
+    let upstreamReq
+    let upstreamRes
+    const cleanup = () => signal?.removeEventListener('abort', abort)
+    const finish = (value, error = null) => {
       if (settled) return
       settled = true
-      resolve(value)
+      cleanup()
+      if (error) reject(error)
+      else resolve(value)
     }
-    const upstreamReq = client(target, { method, headers, agent }, (upstreamRes) => {
+    const abort = () => {
+      upstreamRes?.destroy()
+      upstreamReq?.destroy()
+      finish(null, new CheckCancelledError())
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    upstreamReq = client(target, { method, headers, agent }, (response) => {
+      upstreamRes = response
+      if (signal?.aborted) return abort()
+      upstreamRes.on('error', (error) => {
+        if (signal?.aborted) return finish(null, new CheckCancelledError())
+        finish({
+          statusCode: 502,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'x-model-detect-proxy-error': error.message },
+          body: Buffer.from(JSON.stringify({ error: error.message, type: 'upstream_error' }))
+        })
+      })
       hooks.onResponse?.(upstreamRes.statusCode || 502, upstreamRes.headers)
       const chunks = []
       let captured = 0
@@ -1062,6 +1114,7 @@ function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeou
       upstreamReq.destroy(new Error('upstream_timeout'))
     })
     upstreamReq.on('error', (error) => {
+      if (signal?.aborted) return finish(null, new CheckCancelledError())
       const timedOut = error.message === 'upstream_timeout'
       finish({
         statusCode: timedOut ? 504 : 502,
@@ -1071,6 +1124,7 @@ function requestUpstream(targetUrl, method, headers, body, proxyUrl = '', timeou
     })
     if (body) upstreamReq.write(body)
     upstreamReq.end()
+    if (signal?.aborted) abort()
   })
 }
 
@@ -1184,6 +1238,7 @@ function publicJob(job) {
     completed: job.completed,
     success: job.success,
     failed: job.failed,
+    cancelled: job.cancelled,
     currentProvider: job.currentProvider,
     currentAgent: job.currentAgent,
     currentModel: job.currentModel,
@@ -1209,6 +1264,7 @@ function createJob(target = {}, scheduled = false) {
     completed: 0,
     success: 0,
     failed: 0,
+    cancelled: 0,
     currentProvider: '',
     currentAgent: '',
     currentModel: '',
@@ -1245,36 +1301,104 @@ function jobItemFromTarget(provider, model) {
   }
 }
 
+class CheckCancelledError extends Error {
+  constructor() {
+    super('check_cancelled')
+    this.name = 'CheckCancelledError'
+  }
+}
+
+function isCheckCancelled(error) {
+  return error instanceof CheckCancelledError || error?.name === 'AbortError' || error?.message === 'check_cancelled'
+}
+
+function throwIfCheckCancelled(signal) {
+  if (signal?.aborted) throw new CheckCancelledError()
+}
+
+function targetKey(providerId, agent, modelName) {
+  return `${providerId}:${agent}:${modelName}`
+}
+
+function checkTargets(state, target = {}, scheduled = false) {
+  return state.providers
+    .filter((provider) => provider.enabled && (!target.providerId || provider.id === target.providerId))
+    .flatMap((provider) => {
+      if (scheduled && !provider.scheduleEnabled) return []
+      return provider.models
+        .filter((model) => model.enabled)
+        .filter((model) => !target.agent || model.agent === target.agent)
+        .filter((model) => !target.modelName || model.name === target.modelName)
+        .filter((model) => !(scheduled && model.scheduleEnabled === false))
+        .filter((model) => !(model.agent === 'codex' && !provider.codexEnabled))
+        .filter((model) => !(model.agent === 'claude' && !provider.claudeEnabled))
+        .map((model) => ({ provider, model }))
+    })
+}
+
+function createTargetControl(provider, model, job = null) {
+  return {
+    key: targetKey(provider.id, model.agent, model.name),
+    jobId: job?.id || '',
+    controller: new AbortController(),
+    runId: ''
+  }
+}
+
 function updateJobItem(job, itemId, patch) {
   if (!job) return
   const item = job.items.find((entry) => entry.id === itemId)
   if (item) Object.assign(item, patch)
-  const completedItems = job.items.filter((entry) => ['success', 'failed', 'timeout'].includes(entry.status))
+  const completedItems = job.items.filter((entry) => ['success', 'failed', 'timeout', 'cancelled'].includes(entry.status))
   touchJob(job, {
     completed: completedItems.length,
     success: job.items.filter((entry) => entry.status === 'success').length,
-    failed: job.items.filter((entry) => entry.status === 'failed' || entry.status === 'timeout').length
+    failed: job.items.filter((entry) => entry.status === 'failed' || entry.status === 'timeout').length,
+    cancelled: job.items.filter((entry) => entry.status === 'cancelled').length
   })
 }
 
-async function acquireCheckSlot(maxConcurrent) {
+async function acquireCheckSlot(maxConcurrent, signal) {
+  throwIfCheckCancelled(signal)
   const limit = Math.min(10, Math.max(1, Number(maxConcurrent || 3)))
   if (activeChecks < limit) {
     activeChecks += 1
     return
   }
-  await new Promise((resolve) => checkWaiters.push(resolve))
+  await new Promise((resolve, reject) => {
+    const waiter = {
+      resolve: () => {
+        signal?.removeEventListener('abort', abort)
+        resolve()
+      }
+    }
+    const abort = () => {
+      const index = checkWaiters.indexOf(waiter)
+      if (index >= 0) checkWaiters.splice(index, 1)
+      reject(new CheckCancelledError())
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    checkWaiters.push(waiter)
+  })
+  if (signal?.aborted) {
+    wakeNextCheckWaiter()
+    throw new CheckCancelledError()
+  }
   activeChecks += 1
 }
 
 function releaseCheckSlot() {
   activeChecks = Math.max(0, activeChecks - 1)
-  const next = checkWaiters.shift()
-  if (next) next()
+  wakeNextCheckWaiter()
 }
 
-async function runWithCheckSlot(maxConcurrent, task) {
-  await acquireCheckSlot(maxConcurrent)
+function wakeNextCheckWaiter() {
+  const next = checkWaiters.shift()
+  if (next) next.resolve()
+}
+
+async function runWithCheckSlot(maxConcurrent, signal, task) {
+  await acquireCheckSlot(maxConcurrent, signal)
   try {
     return await task()
   } finally {
@@ -1282,18 +1406,47 @@ async function runWithCheckSlot(maxConcurrent, task) {
   }
 }
 
-function enqueueCheck(target = {}) {
-  const job = createJob(target)
+async function enqueueCheck(target = {}, scheduled = false) {
+  const state = await loadState({ includeRuns: false })
+  const requestedTargets = state.settings.scheduleEnabled || !scheduled ? checkTargets(state, target, scheduled) : []
+  const availableTargets = requestedTargets.filter(({ provider, model }) =>
+    !activeTargetChecks.has(targetKey(provider.id, model.agent, model.name))
+  )
+  if (requestedTargets.length && !availableTargets.length) {
+    const existing = activeTargetChecks.get(targetKey(
+      requestedTargets[0].provider.id,
+      requestedTargets[0].model.agent,
+      requestedTargets[0].model.name
+    ))
+    const existingJob = existing?.jobId ? jobs.get(existing.jobId) : null
+    if (existingJob && !existingJob.done) return { job: existingJob, reused: true }
+  }
+
+  const job = createJob(target, scheduled)
+  const controls = availableTargets.map(({ provider, model }) => {
+    const control = createTargetControl(provider, model, job)
+    activeTargetChecks.set(control.key, control)
+    return control
+  })
+  job.items = availableTargets.map(({ provider, model }) => jobItemFromTarget(provider, model))
+  job.total = job.items.length
   jobs.set(job.id, job)
   pruneJobMap(jobs)
   Promise.resolve().then(async () => {
     touchJob(job, { status: 'running', stage: 'loading_state', message: '读取检测配置' })
     try {
-      const result = await runChecks(target, false, job)
+      const result = await runChecks(target, scheduled, job, { state, targets: availableTargets, controls })
+      const fullyCancelled = result.cancelled > 0 && !result.runs.length && job.failed === 0
       touchJob(job, {
-        status: 'completed',
-        stage: 'completed',
-        message: result.runs.length ? `检测完成：${result.runs.length} 条记录` : '没有可检测的模型',
+        status: fullyCancelled ? 'cancelled' : 'completed',
+        stage: fullyCancelled ? 'cancelled' : 'completed',
+        message: fullyCancelled
+          ? '检测已取消，未生成记录'
+          : result.runs.length
+            ? `检测完成：${result.runs.length} 条记录${result.cancelled ? `，取消 ${result.cancelled} 项` : ''}`
+            : requestedTargets.length && !availableTargets.length
+              ? '相同模型正在检测'
+              : '没有可检测的模型',
         runs: result.runs,
         done: true
       })
@@ -1307,26 +1460,31 @@ function enqueueCheck(target = {}) {
       })
     }
   })
-  return job
+  return { job, reused: false }
 }
 
-async function runChecks(target = {}, scheduled = false, job = null) {
-  const state = await loadState({ includeRuns: false })
+async function runChecks(target = {}, scheduled = false, job = null, prepared = null) {
+  const state = prepared?.state || await loadState({ includeRuns: false })
   if (scheduled && !state.settings.scheduleEnabled) return { state, runs: [] }
-  const providers = state.providers.filter((provider) => provider.enabled && (!target.providerId || provider.id === target.providerId))
-  const targets = providers.flatMap((provider) => {
-    if (scheduled && !provider.scheduleEnabled) return []
-    return provider.models
-      .filter((item) => item.enabled)
-      .filter((model) => !target.agent || model.agent === target.agent)
-      .filter((model) => !target.modelName || model.name === target.modelName)
-      .filter((model) => !(scheduled && model.scheduleEnabled === false))
-      .filter((model) => !(model.agent === 'codex' && !provider.codexEnabled))
-      .filter((model) => !(model.agent === 'claude' && !provider.claudeEnabled))
-      .map((model) => ({ provider, model }))
+  const requestedTargets = prepared?.targets || checkTargets(state, target, scheduled)
+  const targets = []
+  const controls = []
+  requestedTargets.forEach(({ provider, model }, index) => {
+    const key = targetKey(provider.id, model.agent, model.name)
+    const preparedControl = prepared?.controls?.[index]
+    if (preparedControl) {
+      targets.push({ provider, model })
+      controls.push(preparedControl)
+      return
+    }
+    if (activeTargetChecks.has(key)) return
+    const control = createTargetControl(provider, model, job)
+    activeTargetChecks.set(key, control)
+    targets.push({ provider, model })
+    controls.push(control)
   })
   const runs = []
-  const items = targets.map(({ provider, model }) => jobItemFromTarget(provider, model))
+  const items = job?.items?.length ? job.items : targets.map(({ provider, model }) => jobItemFromTarget(provider, model))
   touchJob(job, {
     total: targets.length,
     completed: 0,
@@ -1338,9 +1496,11 @@ async function runChecks(target = {}, scheduled = false, job = null) {
   })
 
   const maxConcurrent = state.settings.maxConcurrentChecks || 1
-  await Promise.all(targets.map(({ provider, model }) =>
-    runWithCheckSlot(maxConcurrent, async () => {
-      const itemId = `${provider.id}:${model.agent}:${model.name}`
+  await Promise.all(targets.map(({ provider, model }, index) => {
+    const control = controls[index]
+    return runWithCheckSlot(maxConcurrent, control.controller.signal, async () => {
+      const itemId = control.key
+      throwIfCheckCancelled(control.controller.signal)
       updateJobItem(job, itemId, { status: 'running' })
       touchJob(job, {
         currentProvider: provider.name,
@@ -1349,10 +1509,14 @@ async function runChecks(target = {}, scheduled = false, job = null) {
         stage: 'cli_running',
         message: `正在检测 ${provider.name} / ${model.agent} / ${model.name}`
       })
+      let run = null
       try {
-        const run = await runOne(state, provider, model)
+        run = await runOne(state, provider, model, control.controller.signal)
+        control.runId = run.id
+        throwIfCheckCancelled(control.controller.signal)
+        await saveRun(run, scheduled, control.controller.signal)
+        throwIfCheckCancelled(control.controller.signal)
         runs.push(run)
-        await saveRun(run, scheduled)
         updateJobItem(job, itemId, {
           status: runItemStatus(run),
           httpStatus: run.httpStatus,
@@ -1362,10 +1526,14 @@ async function runChecks(target = {}, scheduled = false, job = null) {
           runId: run.id
         })
       } catch (error) {
-        updateJobItem(job, itemId, {
-          status: 'failed',
-          errorMessage: error.message
-        })
+        if (isCheckCancelled(error) || control.controller.signal.aborted) {
+          if (control.runId) await removeRunById(control.runId, provider.id, model.agent, model.name)
+          updateJobItem(job, itemId, { status: 'cancelled', errorMessage: '' })
+        } else {
+          updateJobItem(job, itemId, { status: 'failed', errorMessage: error.message })
+        }
+      } finally {
+        if (activeTargetChecks.get(control.key) === control) activeTargetChecks.delete(control.key)
       }
       if (job) {
         touchJob(job, {
@@ -1373,18 +1541,30 @@ async function runChecks(target = {}, scheduled = false, job = null) {
           message: `已完成 ${job.completed}/${targets.length}`
         })
       }
+    }).catch(async (error) => {
+      if (isCheckCancelled(error) || control.controller.signal.aborted) {
+        updateJobItem(job, control.key, { status: 'cancelled', errorMessage: '' })
+        if (activeTargetChecks.get(control.key) === control) activeTargetChecks.delete(control.key)
+        return
+      }
+      throw error
     })
-  ))
+  }))
 
-  if (!runs.length) return { state: await loadState({ includeRuns: false }), runs }
-
-  return { state: await loadState({ includeRuns: false }), runs }
+  return {
+    state: await loadState({ includeRuns: false }),
+    runs,
+    cancelled: job?.cancelled || controls.filter((control) => control.controller.signal.aborted).length
+  }
 }
 
-async function saveRun(run, scheduled = false) {
+async function saveRun(run, scheduled = false, signal) {
+  throwIfCheckCancelled(signal)
   await saveRunDetail(run)
+  throwIfCheckCancelled(signal)
   let dropped = []
   await updateRunSummaries((summaries) => {
+    throwIfCheckCancelled(signal)
     const merged = [
       publicRunSummary(run),
       ...summaries.filter((item) => item.id !== run.id)
@@ -1392,8 +1572,10 @@ async function saveRun(run, scheduled = false) {
     dropped = merged.slice(maxStoredRuns).map((item) => item.id)
     return merged.slice(0, maxStoredRuns)
   })
+  throwIfCheckCancelled(signal)
   for (const id of dropped) await rm(runDetailPath(id), { force: true })
   return updateState((current) => {
+    throwIfCheckCancelled(signal)
     const intervalMs = scheduleIntervalMs(current.settings)
     const provider = current.providers.find((item) => item.id === run.providerId)
     if (provider) {
@@ -1411,7 +1593,38 @@ async function saveRun(run, scheduled = false) {
   })
 }
 
-async function runOne(state, provider, model) {
+async function removeRunById(runId, providerId, agent, modelName) {
+  const summaries = await updateRunSummaries((items) => items.filter((item) => item.id !== runId))
+  await rm(runDetailPath(runId), { force: true })
+  await updateState((state) => {
+    const provider = state.providers.find((item) => item.id === providerId)
+    if (!provider) return state
+    const model = provider.models.find((item) => item.agent === agent && item.name === modelName)
+    if (model) {
+      model.lastRunAt = summaries.find((item) => item.providerId === providerId && item.agent === agent && item.model === modelName)?.createdAt || ''
+    }
+    provider.lastRunAt = summaries.find((item) => item.providerId === providerId)?.createdAt || ''
+    return state
+  })
+}
+
+function cancelCheckJob(job, target = {}) {
+  if (!job || job.done) return 0
+  const controls = [...activeTargetChecks.values()].filter((control) => {
+    if (control.jobId !== job.id) return false
+    const item = job.items.find((entry) => entry.id === control.key)
+    return item
+      && (!target.providerId || item.providerId === target.providerId)
+      && (!target.agent || item.agent === target.agent)
+      && (!target.modelName || item.model === target.modelName)
+  })
+  controls.forEach((control) => control.controller.abort())
+  if (controls.length) touchJob(job, { stage: 'cancelling', message: `正在取消 ${controls.length} 个检测` })
+  return controls.length
+}
+
+async function runOne(state, provider, model, signal) {
+  throwIfCheckCancelled(signal)
   const runId = randomUUID()
   const runtimeBaseUrl = runtimeBaseUrlFor(provider, model.agent)
   const runtimeProvider = { ...provider, baseUrl: runtimeBaseUrl }
@@ -1430,21 +1643,23 @@ async function runOne(state, provider, model) {
     proxyUrl: provider.proxyUrl || '',
     saveBody: provider.saveBody,
     timeoutMs: Math.max(1000, timeoutMs - 3000),
+    signal,
     exchanges: []
   }
   const proxy = await createCaptureProxy(capture)
-  const proxyBaseUrl = proxyBaseUrlFor(proxy.port, runtimeBaseUrl)
-  capture.proxyBaseUrl = proxyBaseUrl
-  await materializeProvider(runtimeProvider, model, proxyBaseUrl, runBase)
-  const commonEnv = {
-    ...process.env,
-    OPENAI_API_KEY: provider.apiKey || process.env.OPENAI_API_KEY,
-    ANTHROPIC_AUTH_TOKEN: provider.apiKey || process.env.ANTHROPIC_AUTH_TOKEN,
-    ANTHROPIC_API_KEY: provider.apiKey || process.env.ANTHROPIC_API_KEY
-  }
-
   let result
   try {
+    throwIfCheckCancelled(signal)
+    const proxyBaseUrl = proxyBaseUrlFor(proxy.port, runtimeBaseUrl)
+    capture.proxyBaseUrl = proxyBaseUrl
+    await materializeProvider(runtimeProvider, model, proxyBaseUrl, runBase)
+    throwIfCheckCancelled(signal)
+    const commonEnv = {
+      ...process.env,
+      OPENAI_API_KEY: provider.apiKey || process.env.OPENAI_API_KEY,
+      ANTHROPIC_AUTH_TOKEN: provider.apiKey || process.env.ANTHROPIC_AUTH_TOKEN,
+      ANTHROPIC_API_KEY: provider.apiKey || process.env.ANTHROPIC_API_KEY
+    }
     if (model.agent === 'codex') {
       const codexHome = join(runBase, 'codex-home')
       const codexWorkspace = join(runBase, 'codex-workspace')
@@ -1457,14 +1672,16 @@ async function runOne(state, provider, model) {
       result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--ephemeral', '--json', prompt], {
         cwd: codexWorkspace,
         env: { ...commonEnv, CODEX_HOME: codexHome },
-        timeoutMs
+        timeoutMs,
+        signal
       })
       if (isCodexInstructionMissing(result)) {
         await ensureCodexInstructionFile(state.settings)
         result = await execProcess(cmd, [...prefix, 'exec', '--skip-git-repo-check', '--ephemeral', '--json', prompt], {
           cwd: codexWorkspace,
           env: { ...commonEnv, CODEX_HOME: codexHome },
-          timeoutMs
+          timeoutMs,
+          signal
         })
       }
     } else {
@@ -1496,14 +1713,16 @@ async function runOne(state, provider, model) {
           CLAUDE_CODE_EFFORT_LEVEL: 'low',
           CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1'
         },
-        timeoutMs
+        timeoutMs,
+        signal
       })
     }
   } finally {
     await proxy.close()
-    await rm(runBase, { recursive: true, force: true })
+    await rm(runBase, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 })
   }
 
+  throwIfCheckCancelled(signal)
   const latencyMs = Date.now() - started
   const exchange = selectExchange(capture.exchanges)
   const logDetail = exchange?.logDetail ?? {
@@ -1588,31 +1807,65 @@ function buildRequest(provider, model, prompt) {
 }
 
 function execProcess(cmd, args, options) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] })
+  throwIfCheckCancelled(options.signal)
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+      windowsHide: true
+    })
     let stdout = ''
     let stderr = ''
     let done = false
-    const timer = setTimeout(() => {
+    let cancelTimer
+    const finish = (value, error = null) => {
+      if (done) return
       done = true
-      child.kill('SIGTERM')
-      resolve({ exitCode: null, stdout, stderr, timedOut: true })
+      clearTimeout(timer)
+      clearTimeout(cancelTimer)
+      options.signal?.removeEventListener('abort', abort)
+      if (error) reject(error)
+      else resolve(value)
+    }
+    const abort = () => {
+      terminateProcessTree(child)
+      cancelTimer = setTimeout(() => finish(null, new CheckCancelledError()), 2000)
+      cancelTimer.unref?.()
+    }
+    const timer = setTimeout(() => {
+      terminateProcessTree(child)
+      finish({ exitCode: null, stdout, stderr, timedOut: true })
     }, options.timeoutMs)
+    options.signal?.addEventListener('abort', abort, { once: true })
     child.stdout.on('data', (chunk) => { stdout = appendLimitedOutput(stdout, chunk) })
     child.stderr.on('data', (chunk) => { stderr = appendLimitedOutput(stderr, chunk) })
     child.on('error', (error) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve({ exitCode: 127, stdout, stderr: `${stderr}${error.message}`, timedOut: false })
+      if (options.signal?.aborted) return finish(null, new CheckCancelledError())
+      finish({ exitCode: 127, stdout, stderr: `${stderr}${error.message}`, timedOut: false })
     })
     child.on('close', (code) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve({ exitCode: code ?? 0, stdout, stderr, timedOut: false })
+      if (options.signal?.aborted) return finish(null, new CheckCancelledError())
+      finish({ exitCode: code ?? 0, stdout, stderr, timedOut: false })
     })
+    if (options.signal?.aborted) abort()
   })
+}
+
+function terminateProcessTree(child) {
+  if (!child.pid) return
+  try {
+    if (process.platform === 'win32') child.kill('SIGTERM')
+    else process.kill(-child.pid, 'SIGTERM')
+  } catch {}
+  const forceKill = setTimeout(() => {
+    try {
+      if (process.platform === 'win32') child.kill('SIGKILL')
+      else process.kill(-child.pid, 'SIGKILL')
+    } catch {}
+  }, 1500)
+  forceKill.unref?.()
 }
 
 function appendLimitedOutput(current, chunk) {
@@ -1634,7 +1887,7 @@ async function scheduleTick() {
     if (!provider.nextRunAt) return true
     return new Date(provider.nextRunAt).getTime() <= now
   })
-  for (const provider of due) await runChecks({ providerId: provider.id }, true)
+  for (const provider of due) await enqueueCheck({ providerId: provider.id }, true)
   } finally {
     scheduleRunning = false
   }
@@ -1713,6 +1966,9 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === 'GET' && pathname === '/api/state') return send(res, 200, await publicAppState())
   if (req.method === 'GET' && pathname === '/api/logs') return send(res, 200, await loadRunSummaries())
+  if (req.method === 'GET' && pathname === '/api/checks') {
+    return send(res, 200, { jobs: [...jobs.values()].filter((job) => !job.done).map(publicJob) })
+  }
   if (req.method === 'GET' && pathname === '/api/backup/export') return send(res, 200, await exportBackup())
   const backupJobMatch = pathname.match(/^\/api\/backup\/import\/([^/]+)$/)
   if (req.method === 'GET' && backupJobMatch) {
@@ -1772,12 +2028,19 @@ async function handleApi(req, res, pathname) {
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)
-    const job = enqueueCheck({
+    const result = await enqueueCheck({
       providerId: body.providerId,
       agent: body.agent,
       modelName: body.modelName
     })
-    return send(res, 202, { job: publicJob(job) })
+    return send(res, 202, { job: publicJob(result.job), reused: result.reused })
+  }
+  const cancelJobMatch = pathname.match(/^\/api\/checks\/([^/]+)\/cancel$/)
+  if (req.method === 'POST' && cancelJobMatch) {
+    const job = jobs.get(cancelJobMatch[1])
+    if (!job) return send(res, 404, { error: 'job_not_found' })
+    const cancelled = cancelCheckJob(job, await readJson(req))
+    return send(res, 200, { job: publicJob(job), cancelled })
   }
   const jobMatch = pathname.match(/^\/api\/checks\/([^/]+)$/)
   if (req.method === 'GET' && jobMatch) {

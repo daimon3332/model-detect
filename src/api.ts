@@ -117,11 +117,22 @@ export async function getBackupImportJobApi(state: AppState, jobId: string) {
 }
 
 export async function startChecksApi(target: CheckTarget = {}) {
-  const result = await api<{ job: CheckJob }>('/api/checks', {
+  return api<{ job: CheckJob; reused: boolean }>('/api/checks', {
     method: 'POST',
     body: target
   })
-  return result.job
+}
+
+export async function getActiveCheckJobsApi() {
+  const result = await api<{ jobs: CheckJob[] }>('/api/checks')
+  return result.jobs
+}
+
+export async function cancelCheckApi(jobId: string, target: CheckTarget = {}) {
+  return api<{ job: CheckJob; cancelled: number }>(`/api/checks/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    body: target
+  })
 }
 
 export async function getCheckJobApi(state: AppState, jobId: string) {

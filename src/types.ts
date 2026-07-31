@@ -90,12 +90,13 @@ export interface BackupImportJob {
 
 export interface CheckJob {
   id: string
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   target: CheckTarget
   total: number
   completed: number
   success: number
   failed: number
+  cancelled: number
   currentProvider: string
   currentAgent: AgentType | ''
   currentModel: string
@@ -115,7 +116,7 @@ export interface CheckJobItem {
   providerName: string
   agent: AgentType
   model: string
-  status: 'queued' | 'running' | 'success' | 'failed' | 'timeout'
+  status: 'queued' | 'running' | 'success' | 'failed' | 'timeout' | 'cancelled'
   httpStatus: number | null
   cliExitCode: number | null
   latencyMs: number

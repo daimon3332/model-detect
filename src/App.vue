@@ -5,6 +5,9 @@ import {
   ElCard,
   ElCheckbox,
   ElDialog,
+  ElDropdown,
+  ElDropdownItem,
+  ElDropdownMenu,
   ElEmpty,
   ElForm,
   ElFormItem,
@@ -22,6 +25,7 @@ import {
 import {
   CirclePlus,
   CircleCheckFilled,
+  ArrowDown,
   Close,
   Connection,
   DataAnalysis,
@@ -34,6 +38,7 @@ import {
   Refresh,
   Setting,
   Timer,
+  User,
   WarningFilled,
   VideoPlay
 } from '@element-plus/icons-vue'
@@ -45,10 +50,12 @@ import {
 } from './mockApi'
 import {
   ApiError,
+  cancelCheckApi,
   checkSessionApi,
   clearRunsApi,
   deleteProviderApi,
   exportBackupApi,
+  getActiveCheckJobsApi,
   getBackupImportJobApi,
   getCheckJobApi,
   getRunApi,
@@ -67,7 +74,7 @@ import {
   startChecksApi
 } from './api'
 import type { AgentType, AppState, BackupImportJob, CheckJob, CheckTarget, ProviderConfig, RunState, TestRun, TestRunSummary } from './types'
-import { agentLabel, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
+import { agentLabel, formatShortTime, formatTime, isHealthy, redact, runText, stateLabel } from './utils'
 
 type PageKey = 'monitor' | 'providers' | 'prompts' | 'logs' | 'tasks' | 'settings'
 type DetailTab = 'cli' | 'request_body' | 'response_body'
@@ -122,7 +129,7 @@ function formatJsonPrimitive(value: unknown) {
 const pages: Array<{ key: PageKey; label: string; icon: unknown }> = [
   { key: 'monitor', label: '模型监控', icon: Monitor },
   { key: 'providers', label: '模型提供商', icon: Files },
-  { key: 'prompts', label: '提示词', icon: EditPen },
+  { key: 'prompts', label: '提示词管理', icon: EditPen },
   { key: 'logs', label: '日志记录', icon: Document },
   { key: 'tasks', label: '定时任务', icon: Timer },
   { key: 'settings', label: '全局设置', icon: Setting }
@@ -145,6 +152,9 @@ const loginLoading = ref(false)
 const newAdminPassword = ref('')
 const confirmAdminPassword = ref('')
 const activeJobs = ref<CheckJob[]>([])
+const startingCheckKeys = ref(new Set<string>())
+const cancellingCheckKeys = ref(new Set<string>())
+const pollingJobIds = new Set<string>()
 const backupFileInput = ref<HTMLInputElement | null>(null)
 const backupImportDialog = ref(false)
 const backupImportJob = ref<BackupImportJob | null>(null)
@@ -170,7 +180,7 @@ const latestLogs = computed(() =>
 const pageMeta: Record<PageKey, { title: string; description: string }> = {
   monitor: { title: '模型监控', description: '查看模型可用性、响应状态和近期检测趋势' },
   providers: { title: '模型提供商', description: '管理接入地址、模型和运行参数' },
-  prompts: { title: '提示词', description: '维护全局、提供商和模型级检测提示词' },
+  prompts: { title: '提示词管理', description: '维护全局、提供商和模型级检测提示词' },
   logs: { title: '日志记录', description: '检索检测结果并查看完整请求与响应' },
   tasks: { title: '定时任务', description: '配置自动检测周期与执行范围' },
   settings: { title: '全局设置', description: '管理运行环境、默认配置、安全与备份' }
@@ -179,9 +189,34 @@ const pageMeta: Record<PageKey, { title: string; description: string }> = {
 const currentPage = computed(() => pageMeta[page.value])
 const totalModels = computed(() => state.providers.reduce((total, provider) => total + provider.models.length, 0))
 const healthyRuns = computed(() => state.runs.filter(isHealthy).length)
-const unhealthyRuns = computed(() => state.runs.length - healthyRuns.value)
-const successRate = computed(() => state.runs.length ? Math.round((healthyRuns.value / state.runs.length) * 100) : 0)
-const recentTrend = computed(() => [...latestLogs.value].slice(0, 12).reverse())
+const modelStates = computed(() => state.providers.flatMap((provider) => provider.models.map((model) => ({
+  provider,
+  model,
+  run: recentRuns(state, provider.id, model.name, model.agent)[0]
+}))))
+const healthyModels = computed(() => modelStates.value.filter((item) => isHealthy(item.run)).length)
+const abnormalModels = computed(() => modelStates.value.filter((item) => item.run && !isHealthy(item.run)).length)
+const uncheckedModels = computed(() => modelStates.value.filter((item) => !item.run).length)
+const normalModelRate = computed(() => totalModels.value ? Math.round((healthyModels.value / totalModels.value) * 100) : 0)
+const timeoutRuns = computed(() => state.runs.filter((run) => run.state === 'timeout').length)
+const failedRuns = computed(() => state.runs.filter((run) => run.state === 'failed').length)
+const trendBuckets = computed(() => {
+  const runs = [...latestLogs.value].slice(0, 24).reverse()
+  if (!runs.length) return []
+  const size = Math.max(1, Math.ceil(runs.length / 6))
+  const buckets = Array.from({ length: Math.ceil(runs.length / size) }, (_, index) => {
+    const items = runs.slice(index * size, (index + 1) * size)
+    return {
+      label: formatShortTime(items.at(-1)?.createdAt || ''),
+      normal: items.filter(isHealthy).length,
+      warning: items.filter((run) => run.state === 'warning' || run.state === 'timeout').length,
+      failed: items.filter((run) => run.state === 'failed').length,
+      total: items.length
+    }
+  })
+  const max = Math.max(...buckets.map((bucket) => bucket.total), 1)
+  return buckets.map((bucket) => ({ ...bucket, height: Math.max(12, Math.round((bucket.total / max) * 100)) }))
+})
 
 const visibleProviders = computed(() =>
   state.providers.filter((provider) => filters.providerId === 'all' || provider.id === filters.providerId)
@@ -214,9 +249,38 @@ const backupJobPercent = (job: BackupImportJob | null) => {
 
 const jobItemTagType = (status: string) => {
   if (status === 'success') return 'success'
-  if (status === 'failed' || status === 'timeout') return 'danger'
-  if (status === 'running') return 'warning'
+  if (status === 'failed') return 'danger'
+  if (status === 'running' || status === 'timeout') return 'warning'
   return 'info'
+}
+
+const jobStatusLabel = (status: string) => ({ queued: '等待中', running: '检测中', completed: '已完成', failed: '失败', cancelled: '已取消' }[status] || status)
+const jobItemStatusLabel = (status: string) => ({ queued: '等待中', running: '检测中', success: '正常', failed: '异常', timeout: '超时', cancelled: '已取消' }[status] || status)
+const stateTagType = (run?: TestRunSummary) => {
+  if (!run) return 'info'
+  if (run.state === 'success') return 'success'
+  if (run.state === 'warning' || run.state === 'timeout') return 'warning'
+  return 'danger'
+}
+
+const latestModelRun = (provider: ProviderConfig, model: ProviderConfig['models'][number]) =>
+  recentRuns(state, provider.id, model.name, model.agent)[0]
+
+const modelCheckKey = (providerId: string, agent: AgentType, modelName: string) => `${providerId}:${agent}:${modelName}`
+const activeModelCheckKeys = computed(() => new Set(
+  activeJobs.value
+    .filter((job) => !job.done)
+    .flatMap((job) => job.items.filter((item) => item.status === 'queued' || item.status === 'running').map((item) => item.id))
+))
+const isModelChecking = (providerId: string, agent: AgentType, modelName: string) => {
+  const key = modelCheckKey(providerId, agent, modelName)
+  return startingCheckKeys.value.has(key) || activeModelCheckKeys.value.has(key)
+}
+const modelCheckJob = (providerId: string, agent: AgentType, modelName: string) => {
+  const key = modelCheckKey(providerId, agent, modelName)
+  return activeJobs.value.find((job) =>
+    !job.done && job.items.some((item) => item.id === key && (item.status === 'queued' || item.status === 'running'))
+  )
 }
 
 const upsertJob = (job: CheckJob) => {
@@ -224,6 +288,12 @@ const upsertJob = (job: CheckJob) => {
   if (index >= 0) activeJobs.value.splice(index, 1, job)
   else activeJobs.value.unshift(job)
   activeJobs.value = activeJobs.value.slice(0, 6)
+}
+
+const syncActiveJobs = async () => {
+  const jobs = await getActiveCheckJobsApi()
+  jobs.forEach(upsertJob)
+  jobs.forEach((job) => pollJob(job.id))
 }
 
 const handleApiError = (error: unknown, fallback: string) => {
@@ -247,6 +317,10 @@ const navigate = (target: PageKey) => {
 
 const dismissJob = (jobId: string) => {
   activeJobs.value = activeJobs.value.filter((job) => job.id !== jobId)
+}
+
+const handleUserCommand = (command: string) => {
+  if (command === 'logout') logout()
 }
 
 const providerModels = (provider: ProviderConfig) =>
@@ -322,17 +396,32 @@ const clearRunRecords = async (target: CheckTarget = {}, label = '全部检测�
 }
 
 const runChecks = async (providerId?: string, agent?: AgentType, modelName?: string) => {
+  const key = providerId && agent && modelName ? modelCheckKey(providerId, agent, modelName) : ''
+  if (key && isModelChecking(providerId!, agent!, modelName!)) {
+    ElMessage.info('该模型正在检测，无需重复提交')
+    return
+  }
+  if (key) startingCheckKeys.value = new Set(startingCheckKeys.value).add(key)
   try {
-    const created = await startChecksApi({ providerId, agent, modelName })
-    upsertJob(created)
-    pollJob(created.id)
-    ElMessage.success('检测任务已加入队列')
+    const result = await startChecksApi({ providerId, agent, modelName })
+    upsertJob(result.job)
+    pollJob(result.job.id)
+    if (result.reused) ElMessage.info('该模型正在检测，已显示现有任务')
+    else ElMessage.success('检测任务已加入队列')
   } catch (error) {
     handleApiError(error, '创建检测任务失败')
+  } finally {
+    if (key) {
+      const next = new Set(startingCheckKeys.value)
+      next.delete(key)
+      startingCheckKeys.value = next
+    }
   }
 }
 
 const pollJob = async (jobId: string) => {
+  if (pollingJobIds.has(jobId)) return
+  pollingJobIds.add(jobId)
   try {
     let job = activeJobs.value.find((item) => item.id === jobId)
     let lastCompleted = job?.completed ?? 0
@@ -347,6 +436,9 @@ const pollJob = async (jobId: string) => {
     }
     if (job?.status === 'failed') {
       ElMessage.error(job.error || '检测任务失败')
+    } else if (job?.status === 'cancelled') {
+      await refreshState(state)
+      ElMessage.info('检测已取消，未生成检测记录')
     } else {
       await refreshState(state)
       const count = job?.runs.length ?? 0
@@ -354,7 +446,34 @@ const pollJob = async (jobId: string) => {
     }
   } catch (error) {
     handleApiError(error, '检测失败')
+  } finally {
+    pollingJobIds.delete(jobId)
   }
+}
+
+const cancelJob = async (job: CheckJob, target: CheckTarget = {}) => {
+  const targetKeyValue = target.providerId && target.agent && target.modelName
+    ? modelCheckKey(target.providerId, target.agent, target.modelName)
+    : `job:${job.id}`
+  if (cancellingCheckKeys.value.has(targetKeyValue)) return
+  cancellingCheckKeys.value = new Set(cancellingCheckKeys.value).add(targetKeyValue)
+  try {
+    const result = await cancelCheckApi(job.id, target)
+    upsertJob(result.job)
+    if (result.cancelled) ElMessage.info('正在取消检测，本次结果不会写入记录')
+    else ElMessage.info('检测任务已经结束')
+  } catch (error) {
+    handleApiError(error, '取消检测失败')
+  } finally {
+    const next = new Set(cancellingCheckKeys.value)
+    next.delete(targetKeyValue)
+    cancellingCheckKeys.value = next
+  }
+}
+
+const cancelModelCheck = (providerId: string, agent: AgentType, modelName: string) => {
+  const job = modelCheckJob(providerId, agent, modelName)
+  if (job) return cancelJob(job, { providerId, agent, modelName })
 }
 
 const openRun = async (run: TestRunSummary) => {
@@ -641,7 +760,7 @@ const pollBackupImportJob = async (jobId: string) => {
 const manualRefresh = async () => {
   refreshing.value = true
   try {
-    await refreshState(state)
+    await Promise.all([refreshState(state), syncActiveJobs()])
   } catch (error) {
     handleApiError(error, '刷新失败')
   } finally {
@@ -664,7 +783,7 @@ const login = async () => {
     await loginApi(loginPassword.value)
     authenticated.value = true
     loginPassword.value = ''
-    await refreshState(state)
+    await Promise.all([refreshState(state), syncActiveJobs()])
   } catch {
     ElMessage.error('密码错误')
   } finally {
@@ -681,7 +800,7 @@ const logout = async () => {
 const boot = async () => {
   checkingAuth.value = true
   authenticated.value = await checkSessionApi()
-  if (authenticated.value) await refreshState(state).catch(() => undefined)
+  if (authenticated.value) await Promise.all([refreshState(state), syncActiveJobs()]).catch(() => undefined)
   checkingAuth.value = false
 }
 
@@ -772,7 +891,16 @@ onMounted(boot)
         <div class="top-actions">
           <el-button :icon="Refresh" :loading="refreshing" @click="manualRefresh">刷新</el-button>
           <el-button :icon="CirclePlus" type="primary" aria-label="添加提供商" title="添加提供商" @click="openCreateProvider">添加提供商</el-button>
-          <el-button plain @click="logout">退出</el-button>
+          <el-dropdown trigger="click" @command="handleUserCommand">
+            <button class="user-menu">
+              <span class="user-avatar"><User /></span>
+              <span>管理员</span>
+              <ArrowDown />
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu><el-dropdown-item command="logout">退出登录</el-dropdown-item></el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </header>
 
@@ -781,67 +909,66 @@ onMounted(boot)
         <div class="metric-grid">
           <article class="metric-card">
             <span class="metric-icon info"><Connection /></span>
-            <div><small>提供商</small><strong>{{ activeProviders.length }}<em>/ {{ state.providers.length }}</em></strong></div>
+            <div><small>提供商</small><strong>{{ state.providers.length }}</strong><p>已启用 {{ activeProviders.length }} 个</p></div>
           </article>
           <article class="metric-card">
-            <span class="metric-icon special"><DataAnalysis /></span>
-            <div><small>已配置模型</small><strong>{{ totalModels }}</strong></div>
+            <span class="metric-icon info"><DataAnalysis /></span>
+            <div><small>已配置模型</small><strong>{{ totalModels }}</strong><p>共 {{ totalModels }} 个模型</p></div>
           </article>
           <article class="metric-card">
             <span class="metric-icon success"><CircleCheckFilled /></span>
-            <div><small>近期正常率</small><strong>{{ successRate }}<em>%</em></strong></div>
+            <div><small>正常模型</small><strong>{{ healthyModels }}</strong><p>{{ normalModelRate }}% 占比</p></div>
           </article>
           <article class="metric-card">
             <span class="metric-icon danger"><WarningFilled /></span>
-            <div><small>异常记录</small><strong>{{ unhealthyRuns }}</strong></div>
+            <div><small>异常模型</small><strong>{{ abnormalModels }}</strong><p>{{ totalModels ? Math.round((abnormalModels / totalModels) * 100) : 0 }}% 占比</p></div>
           </article>
         </div>
 
         <div class="overview-grid">
           <section class="surface-panel trend-panel">
             <div class="panel-heading">
-              <div><strong>近期检测趋势</strong><span>最近 {{ recentTrend.length }} 次检测结果</span></div>
-              <el-tag effect="plain" :type="successRate >= 80 ? 'success' : successRate >= 50 ? 'warning' : 'danger'">
-                {{ successRate }}% 正常
-              </el-tag>
+              <div><strong>近期检测趋势</strong></div>
+              <span class="trend-range">最近 24 次检测</span>
             </div>
-            <div v-if="recentTrend.length" class="trend-chart">
-              <button
-                v-for="run in recentTrend"
-                :key="run.id"
-                class="trend-column"
-                :title="`${run.providerName} / ${run.model} / ${stateLabel(run.state)}`"
-                @click="openRun(run)"
-              >
-                <span :class="run.state" :style="{ height: `${isHealthy(run) ? 78 : 38}%` }"></span>
-                <small>{{ formatTime(run.createdAt).slice(-5) }}</small>
-              </button>
+            <div class="trend-legend"><span class="normal">正常</span><span class="warning">超时或警告</span><span class="failed">异常</span></div>
+            <div v-if="trendBuckets.length" class="trend-chart">
+              <div class="chart-grid"><i></i><i></i><i></i></div>
+              <div v-for="(bucket, index) in trendBuckets" :key="`${bucket.label}-${index}`" class="trend-column">
+                <div class="trend-stack" :style="{ height: `${bucket.height}%` }" :title="`正常 ${bucket.normal}，超时或警告 ${bucket.warning}，异常 ${bucket.failed}`">
+                  <span v-if="bucket.failed" class="failed" :style="{ flex: bucket.failed }"></span>
+                  <span v-if="bucket.warning" class="warning" :style="{ flex: bucket.warning }"></span>
+                  <span v-if="bucket.normal" class="normal" :style="{ flex: bucket.normal }"></span>
+                </div>
+                <small>{{ bucket.label }}</small>
+              </div>
             </div>
             <el-empty v-else :image-size="54" description="暂无趋势数据" />
+            <div v-if="latestLogs.length" class="last-check">最后检测：{{ formatTime(latestLogs[0].createdAt) }}</div>
           </section>
           <section class="surface-panel activity-panel">
-            <div class="panel-heading"><div><strong>运行概览</strong><span>当前检测数据汇总</span></div></div>
+            <div class="panel-heading"><div><strong>运行概览</strong></div></div>
             <dl class="summary-list">
-              <div><dt>正常记录</dt><dd class="success-text">{{ healthyRuns }}</dd></div>
-              <div><dt>异常与超时</dt><dd class="danger-text">{{ unhealthyRuns }}</dd></div>
-              <div><dt>当前任务</dt><dd>{{ activeJobs.filter((job) => !job.done).length }}</dd></div>
+              <div><dt>检测总数</dt><dd class="info-text">{{ state.runs.length }}</dd></div>
+              <div><dt>正常</dt><dd class="success-text">{{ healthyRuns }}</dd></div>
+              <div><dt>超时</dt><dd class="warning-text">{{ timeoutRuns }}</dd></div>
+              <div><dt>异常</dt><dd class="danger-text">{{ failedRuns }}</dd></div>
+              <div><dt>未检测模型</dt><dd>{{ uncheckedModels }}</dd></div>
               <div><dt>定时检测</dt><dd><el-tag size="small" :type="state.settings.scheduleEnabled ? 'success' : 'info'">{{ state.settings.scheduleEnabled ? '已启用' : '未启用' }}</el-tag></dd></div>
             </dl>
           </section>
         </div>
 
-        <el-card shadow="never" class="surface-card">
-          <div class="section-head">
-            <div><strong>模型状态</strong><span>按提供商查看各模型最近检测结果</span></div>
-          </div>
-          <div class="toolbar-only">
+        <el-card shadow="never" class="surface-card model-workspace">
+          <div class="section-head model-section-head">
+            <div><strong>模型状态</strong></div>
             <div class="head-actions">
               <el-select v-model="filters.providerId" class="control" placeholder="提供商">
                 <el-option label="全部提供商" value="all" />
                 <el-option v-for="provider in state.providers" :key="provider.id" :label="provider.name" :value="provider.id" />
               </el-select>
-              <el-select v-model="filters.agent" class="control" placeholder="Agent">
-                <el-option label="全部 Agent" value="all" />
+              <el-select v-model="filters.agent" class="control" placeholder="客户端">
+                <el-option label="全部客户端" value="all" />
                 <el-option label="Codex" value="codex" />
                 <el-option label="Claude Code" value="claude" />
               </el-select>
@@ -857,8 +984,8 @@ onMounted(boot)
                 <el-option label="超时" value="timeout" />
               </el-select>
               <el-button :icon="VideoPlay" type="primary" @click="runChecks()">检测全部</el-button>
-              <el-button :icon="Delete" type="danger" plain :disabled="!state.runs.length" @click="clearRunRecords()">
-                清空全部记录
+              <el-button :icon="Delete" type="danger" text :disabled="!state.runs.length" @click="clearRunRecords()">
+                清空记录
               </el-button>
             </div>
           </div>
@@ -868,7 +995,15 @@ onMounted(boot)
               <div class="job-card-head">
                 <strong>{{ job.message || '检测任务' }}</strong>
                 <div class="job-card-actions">
-                  <el-tag :type="job.status === 'failed' ? 'danger' : job.done ? 'success' : 'primary'">{{ job.status }}</el-tag>
+                  <el-tag :type="job.status === 'failed' ? 'danger' : job.status === 'cancelled' ? 'info' : job.done ? 'success' : 'warning'">{{ jobStatusLabel(job.status) }}</el-tag>
+                  <el-button
+                    v-if="!job.done"
+                    size="small"
+                    type="danger"
+                    plain
+                    :loading="cancellingCheckKeys.has(`job:${job.id}`)"
+                    @click="cancelJob(job)"
+                  >取消任务</el-button>
                   <el-button v-if="job.done" text circle :icon="Close" aria-label="关闭任务" @click="dismissJob(job.id)" />
                 </div>
               </div>
@@ -879,13 +1014,13 @@ onMounted(boot)
                 <span>{{ job.completed }} / {{ job.total }}</span>
                 <span>成功 {{ job.success }}</span>
                 <span>失败 {{ job.failed }}</span>
+                <span v-if="job.cancelled">取消 {{ job.cancelled }}</span>
                 <span>{{ job.currentProvider || '-' }}</span>
-                <span class="mono">{{ job.currentAgent || '-' }} / {{ job.currentModel || '-' }}</span>
-                <span>{{ job.stage }}</span>
+                <span>{{ job.currentAgent ? agentLabel(job.currentAgent as AgentType) : '-' }} / <b class="mono">{{ job.currentModel || '-' }}</b></span>
               </div>
               <div v-if="job.items?.length" class="job-item-list">
                 <div v-for="item in job.items" :key="item.id" class="job-item-row">
-                  <el-tag size="small" :type="jobItemTagType(item.status)" effect="plain">{{ item.status }}</el-tag>
+                  <el-tag size="small" :type="jobItemTagType(item.status)" effect="plain">{{ jobItemStatusLabel(item.status) }}</el-tag>
                   <span>{{ item.providerName }}</span>
                   <span>{{ agentLabel(item.agent) }}</span>
                   <span class="mono">{{ item.model }}</span>
@@ -905,42 +1040,67 @@ onMounted(boot)
           <div v-else class="provider-groups">
             <section v-for="provider in visibleProviders" :key="provider.id" class="provider-group">
               <div class="provider-title">
-                <button @click.stop.prevent="openEditProvider(provider)">{{ provider.name }}</button>
-                <span>{{ provider.baseUrl || '未配置 Base URL' }}</span>
-                <div>
+                <div class="provider-identity">
+                  <button @click.stop.prevent="openEditProvider(provider)">{{ provider.name }}</button>
+                  <el-tag size="small" :type="provider.enabled ? 'success' : 'info'">{{ provider.enabled ? '已启用' : '已停用' }}</el-tag>
+                </div>
+                <span class="provider-endpoint" :title="provider.baseUrl || '未配置接口地址'">接口地址：<b class="mono">{{ provider.baseUrl || '未配置' }}</b></span>
+                <div class="provider-capabilities">
+                  <span>支持客户端：</span>
                   <el-tag v-if="provider.codexEnabled" effect="plain">Codex</el-tag>
                   <el-tag v-if="provider.claudeEnabled" effect="plain" type="success">Claude Code</el-tag>
-                  <el-button size="small" :icon="VideoPlay" @click.stop="runChecks(provider.id)">检测</el-button>
-                  <el-button
-                    size="small"
-                    :icon="Delete"
-                    type="danger"
-                    plain
-                    :disabled="!state.runs.some((run) => run.providerId === provider.id)"
-                    @click.stop="clearRunRecords({ providerId: provider.id }, `${provider.name} 的检测记录`)"
-                  >
-                    清空
-                  </el-button>
+                  <span>模型数：{{ provider.models.length }}</span>
                 </div>
               </div>
 
               <div v-if="providerModels(provider).length" class="monitor-table">
                 <div class="table-head">
-                  <span>模型</span>
-                  <span>Agent</span>
+                  <span>模型名称</span>
+                  <span>客户端</span>
+                  <span>检测状态</span>
+                  <span>最后检测</span>
+                  <span>响应结果与近期记录</span>
                   <span>操作</span>
-                  <span>最近 10 次检测</span>
                 </div>
                 <div v-for="model in providerModels(provider)" :key="model.id" class="table-row">
-                  <span class="mono">{{ model.name }}</span>
-                  <el-tag effect="plain" round>{{ agentLabel(model.agent) }}</el-tag>
+                  <strong class="mono model-name">{{ model.name }}</strong>
+                  <el-tag effect="plain" :type="model.agent === 'claude' ? 'success' : 'primary'">{{ agentLabel(model.agent) }}</el-tag>
+                  <el-tag effect="plain" :type="isModelChecking(provider.id, model.agent, model.name) ? 'warning' : stateTagType(latestModelRun(provider, model))">
+                    {{ isModelChecking(provider.id, model.agent, model.name) ? '检测中' : latestModelRun(provider, model) ? stateLabel(latestModelRun(provider, model)!.state) : '未检测' }}
+                  </el-tag>
+                  <span class="last-run-time">{{ latestModelRun(provider, model) ? formatTime(latestModelRun(provider, model)!.createdAt) : '-' }}</span>
+                  <div class="result-cell">
+                    <span v-if="latestModelRun(provider, model)" class="result-summary">
+                      <el-tag size="small" effect="plain" :type="stateTagType(latestModelRun(provider, model))">{{ runText(latestModelRun(provider, model)) }}</el-tag>
+                      <span :title="latestModelRun(provider, model)?.errorMessage || ''">{{ latestModelRun(provider, model)?.errorMessage || stateLabel(latestModelRun(provider, model)!.state) }}</span>
+                    </span>
+                    <span v-else class="muted">暂无结果</span>
+                    <span v-if="recentRuns(state, provider.id, model.name, model.agent).length" class="recent-status-dots">
+                      <button
+                        v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
+                        :key="run.id"
+                        :class="run.state"
+                        :title="`${formatTime(run.createdAt)} / ${stateLabel(run.state)}`"
+                        @click="openRun(run)"
+                      ></button>
+                    </span>
+                  </div>
                   <div class="row-actions">
-                    <el-button size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
                     <el-button
+                      v-if="isModelChecking(provider.id, model.agent, model.name)"
                       size="small"
-                      :icon="Delete"
                       type="danger"
                       plain
+                      :icon="Close"
+                      :loading="cancellingCheckKeys.has(modelCheckKey(provider.id, model.agent, model.name))"
+                      @click="cancelModelCheck(provider.id, model.agent, model.name)"
+                    >取消</el-button>
+                    <el-button v-else size="small" :icon="VideoPlay" @click="runChecks(provider.id, model.agent, model.name)">检测</el-button>
+                    <el-button v-if="latestModelRun(provider, model)" size="small" @click="openRun(latestModelRun(provider, model)!)">详情</el-button>
+                    <el-button
+                      size="small"
+                      type="danger"
+                      text
                       :disabled="!recentRuns(state, provider.id, model.name, model.agent).length"
                       @click="clearRunRecords(
                         { providerId: provider.id, agent: model.agent, modelName: model.name },
@@ -949,21 +1109,6 @@ onMounted(boot)
                     >
                       清空
                     </el-button>
-                  </div>
-                  <div class="run-strip">
-                    <button
-                      v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
-                      :key="run.id"
-                      class="run-chip"
-                      :class="run.state"
-                      @click="openRun(run)"
-                    >
-                      <b>{{ runText(run) }}</b>
-                      <small>{{ formatTime(run.createdAt) }}</small>
-                    </button>
-                    <span v-if="!recentRuns(state, provider.id, model.name, model.agent).length" class="muted">
-                      暂无检测记录
-                    </span>
                   </div>
                 </div>
               </div>
