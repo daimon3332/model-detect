@@ -3,7 +3,7 @@ import { request as httpsRequest } from 'node:https'
 import { spawn } from 'node:child_process'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
-import { extname, join, resolve } from 'node:path'
+import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -23,6 +23,7 @@ const maxCliOutputChars = 50_000
 const maxCapturedExchanges = 3
 const maxStoredRuns = 500
 const maxRunSummaries = 1000
+const maxInMemoryJobs = 100
 const defaultTimeoutSeconds = 30
 const defaultCodexInstruction = 'You are Codex, a coding agent based on GPT-5.\n'
 
@@ -72,8 +73,10 @@ const defaultClaudeSettings = `{
 const sessions = new Set()
 const jobs = new Map()
 const backupJobs = new Map()
+const cliUpdatePromises = new Map()
 let stateWriteQueue = Promise.resolve()
 let scheduleRunning = false
+let updateRunning = false
 let activeChecks = 0
 const checkWaiters = []
 
@@ -213,11 +216,11 @@ function normalizeSettings(settings = {}) {
     merged.scheduleHours = Math.floor((total % 1440) / 60)
     merged.scheduleMinutes = total % 60
   }
-  merged.scheduleDays = Number(merged.scheduleDays || 0)
-  merged.scheduleHours = Number(merged.scheduleHours || 0)
-  merged.scheduleMinutes = Number(merged.scheduleMinutes || 0)
+  merged.scheduleDays = Math.min(365, Math.max(0, Number(merged.scheduleDays || 0)))
+  merged.scheduleHours = Math.min(23, Math.max(0, Number(merged.scheduleHours || 0)))
+  merged.scheduleMinutes = Math.min(59, Math.max(0, Number(merged.scheduleMinutes || 0)))
   merged.autoUpdateEnabled = merged.autoUpdateEnabled !== false
-  merged.autoUpdateIntervalDays = Math.max(1, Number(merged.autoUpdateIntervalDays || 4))
+  merged.autoUpdateIntervalDays = Math.min(365, Math.max(1, Number(merged.autoUpdateIntervalDays || 4)))
   merged.defaultTimeoutSeconds = Math.min(600, Math.max(5, Number(merged.defaultTimeoutSeconds || defaultTimeoutSeconds)))
   merged.maxConcurrentChecks = Math.min(3, Math.max(1, Number(merged.maxConcurrentChecks || 1)))
   merged.defaultCodexConfig = normalizeDefaultCodexConfig(merged.defaultCodexConfig)
@@ -359,17 +362,33 @@ async function updateState(mutator) {
 }
 
 async function runCliUpdate(target) {
+  if (cliUpdatePromises.has(target)) return cliUpdatePromises.get(target)
   const args = target === 'codex'
     ? ['install', '-g', '@openai/codex', '--registry=https://registry.npmjs.org/']
     : ['install', '-g', '@anthropic-ai/claude-code@latest', '--registry=https://registry.npmjs.org/']
-  return await new Promise((resolve, reject) => {
-    const child = spawn('npm', args, { shell: true, windowsHide: true })
+  const promise = new Promise((resolve, reject) => {
+    const command = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const child = spawn(command, args, { windowsHide: true })
     let output = ''
     child.stdout.on('data', (chunk) => { output += chunk.toString() })
     child.stderr.on('data', (chunk) => { output += chunk.toString() })
     child.on('error', reject)
     child.on('close', (code) => resolve({ ok: code === 0, output: output.slice(-5000) }))
   })
+  cliUpdatePromises.set(target, promise)
+  try {
+    return await promise
+  } finally {
+    cliUpdatePromises.delete(target)
+  }
+}
+
+function pruneJobMap(map) {
+  while (map.size > maxInMemoryJobs) {
+    const oldestDone = [...map].find(([, job]) => job.done)
+    if (!oldestDone) return
+    map.delete(oldestDone[0])
+  }
 }
 
 async function updateRuns(mutator) {
@@ -607,6 +626,16 @@ async function updateScheduleSettings(body = {}) {
           model.nextRunAt = ''
         })
       })
+    } else {
+      const nextRunAt = new Date(Date.now() + scheduleIntervalMs(state.settings)).toISOString()
+      state.providers.forEach((provider) => {
+        provider.nextRunAt = provider.enabled && provider.scheduleEnabled ? nextRunAt : ''
+        provider.models.forEach((model) => {
+          model.nextRunAt = provider.enabled && provider.scheduleEnabled && model.enabled && model.scheduleEnabled !== false
+            ? nextRunAt
+            : ''
+        })
+      })
     }
     return state
   })
@@ -624,6 +653,12 @@ async function updateProviderSchedule(body = {}) {
       provider.models.forEach((model) => {
         model.nextRunAt = ''
       })
+    } else if (state.settings.scheduleEnabled && provider.enabled) {
+      const nextRunAt = new Date(Date.now() + scheduleIntervalMs(state.settings)).toISOString()
+      provider.nextRunAt = nextRunAt
+      provider.models.forEach((model) => {
+        model.nextRunAt = model.enabled && model.scheduleEnabled !== false ? nextRunAt : ''
+      })
     }
     return state
   })
@@ -639,7 +674,9 @@ async function updateModelSchedule(body = {}) {
     const model = provider?.models.find((item) => item.agent === agent && item.name === modelName)
     if (model) {
       model.scheduleEnabled = enabled
-      if (!enabled) model.nextRunAt = ''
+      model.nextRunAt = enabled && state.settings.scheduleEnabled && provider?.enabled && provider.scheduleEnabled
+        ? new Date(Date.now() + scheduleIntervalMs(state.settings)).toISOString()
+        : ''
     }
     return state
   })
@@ -711,6 +748,7 @@ function publicBackupJob(job) {
 function enqueueBackupImport(body = {}) {
   const job = createBackupJob()
   backupJobs.set(job.id, job)
+  pruneJobMap(backupJobs)
   Promise.resolve().then(() => runBackupImportJob(job, body)).catch((error) => {
     touchBackupJob(job, {
       status: 'failed',
@@ -1247,6 +1285,7 @@ async function runWithCheckSlot(maxConcurrent, task) {
 function enqueueCheck(target = {}) {
   const job = createJob(target)
   jobs.set(job.id, job)
+  pruneJobMap(jobs)
   Promise.resolve().then(async () => {
     touchJob(job, { status: 'running', stage: 'loading_state', message: '读取检测配置' })
     try {
@@ -1359,7 +1398,7 @@ async function saveRun(run, scheduled = false) {
     const provider = current.providers.find((item) => item.id === run.providerId)
     if (provider) {
       provider.lastRunAt = run.createdAt
-      provider.nextRunAt = current.settings.scheduleEnabled && provider.scheduleEnabled
+      if (scheduled) provider.nextRunAt = current.settings.scheduleEnabled && provider.scheduleEnabled
         ? new Date(Date.now() + intervalMs).toISOString()
         : ''
       const model = provider.models.find((item) => item.agent === run.agent && item.name === run.model)
@@ -1588,20 +1627,6 @@ async function scheduleTick() {
   scheduleRunning = true
   try {
   const state = await loadState({ includeRuns: false })
-  if (state.settings.autoUpdateEnabled) {
-    const now = Date.now()
-    for (const target of ['codex', 'claude']) {
-      const field = target === 'codex' ? 'codexLastUpdateAt' : 'claudeLastUpdateAt'
-      const last = state.settings[field] ? new Date(state.settings[field]).getTime() : 0
-      if (!last || now - last >= state.settings.autoUpdateIntervalDays * 86400000) {
-        try {
-          const result = await runCliUpdate(target)
-          await updateState((current) => { current.settings[field] = new Date().toISOString(); return current })
-          if (!result.ok) console.error(`${target} update failed: ${result.output}`)
-        } catch (error) { console.error(`${target} update error: ${error.message}`) }
-      }
-    }
-  }
   if (!state.settings.scheduleEnabled) return
   const now = Date.now()
   const due = state.providers.filter((provider) => {
@@ -1615,11 +1640,42 @@ async function scheduleTick() {
   }
 }
 
+async function autoUpdateTick() {
+  if (updateRunning) return
+  updateRunning = true
+  try {
+    const state = await loadState({ includeRuns: false })
+    if (!state.settings.autoUpdateEnabled) return
+    const now = Date.now()
+    for (const target of ['codex', 'claude']) {
+      const field = target === 'codex' ? 'codexLastUpdateAt' : 'claudeLastUpdateAt'
+      const last = state.settings[field] ? new Date(state.settings[field]).getTime() : 0
+      if (last && now - last < state.settings.autoUpdateIntervalDays * 86400000) continue
+      try {
+        const result = await runCliUpdate(target)
+        if (!result.ok) {
+          console.error(`${target} update failed: ${result.output}`)
+          continue
+        }
+        await updateState((current) => {
+          current.settings[field] = new Date().toISOString()
+          return current
+        })
+      } catch (error) {
+        console.error(`${target} update error: ${error.message}`)
+      }
+    }
+  } finally {
+    updateRunning = false
+  }
+}
+
 async function serveStatic(req, res) {
   const dist = join(root, 'dist')
   const requested = decodeURIComponent(new URL(req.url, 'http://localhost').pathname)
   const file = requested === '/' ? join(dist, 'index.html') : resolve(join(dist, requested))
-  const finalFile = file.startsWith(dist) ? file : join(dist, 'index.html')
+  const relativePath = relative(dist, file)
+  const finalFile = !relativePath.startsWith('..') && !isAbsolute(relativePath) ? file : join(dist, 'index.html')
   try {
     await stat(finalFile)
     res.writeHead(200, { 'content-type': mime[extname(finalFile)] || 'application/octet-stream' })
@@ -1706,12 +1762,13 @@ async function handleApi(req, res, pathname) {
     const body = await readJson(req)
     if (!['codex', 'claude'].includes(body.target)) return send(res, 400, { error: 'invalid_target' })
     const result = await runCliUpdate(body.target)
+    if (!result.ok) return send(res, 500, { error: result.output || `${body.target}_update_failed` })
     const field = body.target === 'codex' ? 'codexLastUpdateAt' : 'claudeLastUpdateAt'
     const state = await updateState((current) => {
       current.settings[field] = new Date().toISOString()
       return current
     })
-    return send(res, result.ok ? 200 : 500, { ...publicState(state, { includeRuns: false }), update: { target: body.target, ...result } })
+    return send(res, 200, { ...publicState(state, { includeRuns: false }), update: { target: body.target, ...result } })
   }
   if (req.method === 'POST' && pathname === '/api/checks') {
     const body = await readJson(req)
@@ -1738,6 +1795,7 @@ async function handleApi(req, res, pathname) {
 
 await ensureData()
 setInterval(() => scheduleTick().catch((error) => console.error(error)), schedulerMs)
+setInterval(() => autoUpdateTick().catch((error) => console.error(error)), schedulerMs)
 
 createServer(async (req, res) => {
   try {

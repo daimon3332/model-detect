@@ -21,14 +21,20 @@ import {
 } from 'element-plus'
 import {
   CirclePlus,
+  CircleCheckFilled,
+  Close,
+  Connection,
+  DataAnalysis,
   Delete,
   Document,
   EditPen,
   Files,
   Monitor,
+  Menu,
   Refresh,
   Setting,
   Timer,
+  WarningFilled,
   VideoPlay
 } from '@element-plus/icons-vue'
 import {
@@ -144,6 +150,9 @@ const backupImportDialog = ref(false)
 const backupImportJob = ref<BackupImportJob | null>(null)
 const scheduleSaving = reactive<Record<string, boolean>>({})
 const updateLoading = reactive<Record<string, boolean>>({ codex: false, claude: false })
+const sidebarOpen = ref(false)
+const settingsSaving = ref(false)
+const refreshing = ref(false)
 
 const filters = reactive({
   providerId: 'all',
@@ -157,6 +166,22 @@ const selectedProvider = computed(() => state.providers.find((item) => item.id =
 const latestLogs = computed(() =>
   [...state.runs].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
 )
+
+const pageMeta: Record<PageKey, { title: string; description: string }> = {
+  monitor: { title: '模型监控', description: '查看模型可用性、响应状态和近期检测趋势' },
+  providers: { title: '模型提供商', description: '管理接入地址、模型和运行参数' },
+  prompts: { title: '提示词', description: '维护全局、提供商和模型级检测提示词' },
+  logs: { title: '日志记录', description: '检索检测结果并查看完整请求与响应' },
+  tasks: { title: '定时任务', description: '配置自动检测周期与执行范围' },
+  settings: { title: '全局设置', description: '管理运行环境、默认配置、安全与备份' }
+}
+
+const currentPage = computed(() => pageMeta[page.value])
+const totalModels = computed(() => state.providers.reduce((total, provider) => total + provider.models.length, 0))
+const healthyRuns = computed(() => state.runs.filter(isHealthy).length)
+const unhealthyRuns = computed(() => state.runs.length - healthyRuns.value)
+const successRate = computed(() => state.runs.length ? Math.round((healthyRuns.value / state.runs.length) * 100) : 0)
+const recentTrend = computed(() => [...latestLogs.value].slice(0, 12).reverse())
 
 const visibleProviders = computed(() =>
   state.providers.filter((provider) => filters.providerId === 'all' || provider.id === filters.providerId)
@@ -198,6 +223,7 @@ const upsertJob = (job: CheckJob) => {
   const index = activeJobs.value.findIndex((item) => item.id === job.id)
   if (index >= 0) activeJobs.value.splice(index, 1, job)
   else activeJobs.value.unshift(job)
+  activeJobs.value = activeJobs.value.slice(0, 6)
 }
 
 const handleApiError = (error: unknown, fallback: string) => {
@@ -206,8 +232,21 @@ const handleApiError = (error: unknown, fallback: string) => {
     ElMessage.error('登录已过期，请重新输入管理员密码')
     return
   }
-  const message = error instanceof Error ? error.message : fallback
+  let message = error instanceof Error ? error.message : fallback
+  try {
+    const parsed = JSON.parse(message) as { error?: string; message?: string }
+    message = parsed.message || parsed.error || message
+  } catch {}
   ElMessage.error(message || fallback)
+}
+
+const navigate = (target: PageKey) => {
+  page.value = target
+  sidebarOpen.value = false
+}
+
+const dismissJob = (jobId: string) => {
+  activeJobs.value = activeJobs.value.filter((job) => job.id !== jobId)
 }
 
 const providerModels = (provider: ProviderConfig) =>
@@ -437,6 +476,7 @@ const saveSettings = async () => {
     }
     extra.adminPassword = newAdminPassword.value
   }
+  settingsSaving.value = true
   try {
     await saveSettingsApi(state, extra)
     newAdminPassword.value = ''
@@ -444,6 +484,8 @@ const saveSettings = async () => {
     ElMessage.success('已保存')
   } catch (error) {
     handleApiError(error, '保存设置失败')
+  } finally {
+    settingsSaving.value = false
   }
 }
 
@@ -492,6 +534,10 @@ const saveScheduleSettings = async (rollback?: () => void) => {
   const key = 'global'
   setScheduleSaving(key, true)
   try {
+    if (state.settings.scheduleDays + state.settings.scheduleHours + state.settings.scheduleMinutes <= 0) {
+      state.settings.scheduleMinutes = 1
+      ElMessage.warning('检测周期不能为 0，已调整为 1 分钟')
+    }
     await saveScheduleSettingsApi(state, {
       scheduleEnabled: state.settings.scheduleEnabled,
       scheduleDays: state.settings.scheduleDays,
@@ -593,10 +639,13 @@ const pollBackupImportJob = async (jobId: string) => {
 }
 
 const manualRefresh = async () => {
+  refreshing.value = true
   try {
     await refreshState(state)
   } catch (error) {
     handleApiError(error, '刷新失败')
+  } finally {
+    refreshing.value = false
   }
 }
 
@@ -680,32 +729,111 @@ onMounted(boot)
   </div>
 
   <div v-else class="app-shell">
-    <header class="topbar">
+    <button v-if="sidebarOpen" class="sidebar-backdrop" aria-label="关闭导航" @click="sidebarOpen = false"></button>
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
       <div class="brand">
         <span class="brand-mark">M</span>
-        <span>Model Detect</span>
+        <div>
+          <strong>Model Detect</strong>
+          <small>模型可用性平台</small>
+        </div>
+        <el-button class="sidebar-close" text circle :icon="Close" aria-label="关闭导航" @click="sidebarOpen = false" />
       </div>
-      <nav class="nav-tabs">
+      <nav class="nav-tabs" aria-label="主导航">
         <button
           v-for="item in pages"
           :key="item.key"
           class="nav-item"
           :class="{ active: page === item.key }"
-          @click="page = item.key"
+          @click="navigate(item.key)"
         >
           <component :is="item.icon" />
-          {{ item.label }}
+          <span>{{ item.label }}</span>
         </button>
       </nav>
-      <div class="top-actions">
-        <el-button :icon="CirclePlus" type="primary" @click="openCreateProvider">添加提供商</el-button>
-        <el-button @click="logout">退出</el-button>
+      <div class="sidebar-footer">
+        <span class="status-dot"></span>
+        <div>
+          <strong>服务已连接</strong>
+          <small>{{ activeProviders.length }} 个提供商已启用</small>
+        </div>
       </div>
-    </header>
+    </aside>
 
-    <main class="workspace">
+    <div class="app-main">
+      <header class="topbar">
+        <div class="page-heading">
+          <el-button class="menu-button" text circle :icon="Menu" aria-label="打开导航" @click="sidebarOpen = true" />
+          <div>
+            <h1>{{ currentPage.title }}</h1>
+            <p>{{ currentPage.description }}</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <el-button :icon="Refresh" :loading="refreshing" @click="manualRefresh">刷新</el-button>
+          <el-button :icon="CirclePlus" type="primary" aria-label="添加提供商" title="添加提供商" @click="openCreateProvider">添加提供商</el-button>
+          <el-button plain @click="logout">退出</el-button>
+        </div>
+      </header>
+
+      <main class="workspace">
       <section v-if="page === 'monitor'" class="page-grid">
-        <el-card shadow="never" class="glass-card">
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span class="metric-icon info"><Connection /></span>
+            <div><small>提供商</small><strong>{{ activeProviders.length }}<em>/ {{ state.providers.length }}</em></strong></div>
+          </article>
+          <article class="metric-card">
+            <span class="metric-icon special"><DataAnalysis /></span>
+            <div><small>已配置模型</small><strong>{{ totalModels }}</strong></div>
+          </article>
+          <article class="metric-card">
+            <span class="metric-icon success"><CircleCheckFilled /></span>
+            <div><small>近期正常率</small><strong>{{ successRate }}<em>%</em></strong></div>
+          </article>
+          <article class="metric-card">
+            <span class="metric-icon danger"><WarningFilled /></span>
+            <div><small>异常记录</small><strong>{{ unhealthyRuns }}</strong></div>
+          </article>
+        </div>
+
+        <div class="overview-grid">
+          <section class="surface-panel trend-panel">
+            <div class="panel-heading">
+              <div><strong>近期检测趋势</strong><span>最近 {{ recentTrend.length }} 次检测结果</span></div>
+              <el-tag effect="plain" :type="successRate >= 80 ? 'success' : successRate >= 50 ? 'warning' : 'danger'">
+                {{ successRate }}% 正常
+              </el-tag>
+            </div>
+            <div v-if="recentTrend.length" class="trend-chart">
+              <button
+                v-for="run in recentTrend"
+                :key="run.id"
+                class="trend-column"
+                :title="`${run.providerName} / ${run.model} / ${stateLabel(run.state)}`"
+                @click="openRun(run)"
+              >
+                <span :class="run.state" :style="{ height: `${isHealthy(run) ? 78 : 38}%` }"></span>
+                <small>{{ formatTime(run.createdAt).slice(-5) }}</small>
+              </button>
+            </div>
+            <el-empty v-else :image-size="54" description="暂无趋势数据" />
+          </section>
+          <section class="surface-panel activity-panel">
+            <div class="panel-heading"><div><strong>运行概览</strong><span>当前检测数据汇总</span></div></div>
+            <dl class="summary-list">
+              <div><dt>正常记录</dt><dd class="success-text">{{ healthyRuns }}</dd></div>
+              <div><dt>异常与超时</dt><dd class="danger-text">{{ unhealthyRuns }}</dd></div>
+              <div><dt>当前任务</dt><dd>{{ activeJobs.filter((job) => !job.done).length }}</dd></div>
+              <div><dt>定时检测</dt><dd><el-tag size="small" :type="state.settings.scheduleEnabled ? 'success' : 'info'">{{ state.settings.scheduleEnabled ? '已启用' : '未启用' }}</el-tag></dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <el-card shadow="never" class="surface-card">
+          <div class="section-head">
+            <div><strong>模型状态</strong><span>按提供商查看各模型最近检测结果</span></div>
+          </div>
           <div class="toolbar-only">
             <div class="head-actions">
               <el-select v-model="filters.providerId" class="control" placeholder="提供商">
@@ -739,9 +867,10 @@ onMounted(boot)
             <article v-for="job in activeJobs" :key="job.id" class="job-card" :class="job.status">
               <div class="job-card-head">
                 <strong>{{ job.message || '检测任务' }}</strong>
-                <el-tag :type="job.status === 'failed' ? 'danger' : job.done ? 'success' : 'primary'">
-                  {{ job.status }}
-                </el-tag>
+                <div class="job-card-actions">
+                  <el-tag :type="job.status === 'failed' ? 'danger' : job.done ? 'success' : 'primary'">{{ job.status }}</el-tag>
+                  <el-button v-if="job.done" text circle :icon="Close" aria-label="关闭任务" @click="dismissJob(job.id)" />
+                </div>
               </div>
               <div class="progress-bar">
                 <span :style="{ width: `${jobPercent(job)}%` }"></span>
@@ -845,8 +974,9 @@ onMounted(boot)
       </section>
 
       <section v-if="page === 'providers'" class="page-grid">
-        <el-card shadow="never" class="glass-card">
-          <div class="toolbar-only">
+        <el-card shadow="never" class="surface-card">
+          <div class="section-head">
+            <div><strong>提供商列表</strong><span>配置模型接入和运行能力</span></div>
             <el-button type="primary" :icon="CirclePlus" @click="openCreateProvider">添加提供商</el-button>
           </div>
 
@@ -863,9 +993,9 @@ onMounted(boot)
                 </div>
                 <p>{{ provider.baseUrl || '未配置 Base URL' }}</p>
                 <div class="provider-meta">
-                  <span>Timeout: <b>{{ provider.timeoutSeconds }}s</b></span>
-                  <span>Schedule: <b>{{ provider.scheduleEnabled ? 'on' : 'off' }}</b></span>
-                  <span>Proxy: <b>{{ provider.proxyUrl || '无代理' }}</b></span>
+                  <span>超时 <b>{{ provider.timeoutSeconds }} 秒</b></span>
+                  <span>定时任务 <b>{{ provider.scheduleEnabled ? '已启用' : '未启用' }}</b></span>
+                  <span>代理 <b>{{ provider.proxyUrl || '未配置' }}</b></span>
                 </div>
                 <div class="agent-tags">
                   <el-tag v-if="provider.codexEnabled" effect="plain">Codex</el-tag>
@@ -884,7 +1014,8 @@ onMounted(boot)
       </section>
 
       <section v-if="page === 'prompts'" class="page-grid">
-        <el-card shadow="never" class="glass-card prompt-card">
+        <el-card shadow="never" class="surface-card prompt-card">
+          <div class="section-head"><div><strong>检测提示词</strong><span>下级留空时自动继承上级配置</span></div></div>
           <div class="prompt-global">
             <el-form label-position="top">
               <el-form-item label="Codex 全局 Prompt">
@@ -924,12 +1055,15 @@ onMounted(boot)
       </section>
 
       <section v-if="page === 'logs'" class="page-grid">
-        <el-card shadow="never" class="glass-card">
-          <div class="toolbar-only">
-            <el-button :icon="Refresh" @click="manualRefresh">刷新</el-button>
+        <el-card shadow="never" class="surface-card">
+          <div class="section-head">
+            <div><strong>检测日志</strong><span>共 {{ latestLogs.length }} 条记录</span></div>
+            <div class="head-actions">
+            <el-button :icon="Refresh" :loading="refreshing" @click="manualRefresh">刷新</el-button>
             <el-button :icon="Delete" type="danger" plain :disabled="!state.runs.length" @click="clearRunRecords()">
               清空全部记录
             </el-button>
+            </div>
           </div>
 
           <el-empty v-if="!latestLogs.length" description="暂无日志记录" />
@@ -959,7 +1093,8 @@ onMounted(boot)
       </section>
 
       <section v-if="page === 'tasks'" class="page-grid">
-        <el-card shadow="never" class="glass-card">
+        <el-card shadow="never" class="surface-card">
+          <div class="section-head"><div><strong>自动检测计划</strong><span>全局、提供商和模型三级开关共同决定执行范围</span></div></div>
           <div class="task-global">
             <el-switch
               v-model="state.settings.scheduleEnabled"
@@ -1003,62 +1138,70 @@ onMounted(boot)
       </section>
 
       <section v-if="page === 'settings'" class="page-grid">
-        <el-card shadow="never" class="glass-card settings-card">
-          <div class="toolbar-only">
+        <el-card shadow="never" class="surface-card settings-card">
+          <div class="section-head settings-toolbar">
+            <div><strong>系统配置</strong><span>修改后统一保存，更新和备份操作即时执行</span></div>
+            <div class="head-actions">
             <el-button @click="exportBackup">导出备份</el-button>
             <el-button @click="triggerBackupImport">导入备份</el-button>
-            <el-button @click="resetAllProviderConfig('codex')">重置所有 Codex config.toml</el-button>
-            <el-button @click="resetAllProviderConfig('claude')">重置所有 Claude settings.json</el-button>
-            <el-button type="primary" @click="saveSettings">保存</el-button>
+            <el-button type="primary" :loading="settingsSaving" @click="saveSettings">保存设置</el-button>
+            </div>
             <input ref="backupFileInput" type="file" accept="application/json" class="hidden-file-input" @change="importBackupFile" />
           </div>
-          <el-form label-position="top">
-            <el-form-item label="CLI 自动更新">
-              <el-switch v-model="state.settings.autoUpdateEnabled" active-text="启用" />
-              <el-input-number v-model="state.settings.autoUpdateIntervalDays" :min="1" :max="365" />
-              <el-button :loading="updateLoading.codex" @click="updateCli('codex')">更新 Codex</el-button>
-              <el-button :loading="updateLoading.claude" @click="updateCli('claude')">更新 Claude Code</el-button>
-            </el-form-item>
-            <el-form-item label="Codex 命令">
-              <el-input v-model="state.settings.codexCommand" />
-            </el-form-item>
-            <el-form-item label="Claude Code 命令">
-              <el-input v-model="state.settings.claudeCommand" />
-            </el-form-item>
-            <el-form-item label="数据目录">
-              <el-input v-model="state.settings.dataDir" />
-            </el-form-item>
-            <el-form-item label="日志保留天数">
-              <el-input-number v-model="state.settings.logRetentionDays" :min="1" :max="365" />
-            </el-form-item>
-            <el-form-item label="默认检测超时（秒）">
-              <el-input-number v-model="state.settings.defaultTimeoutSeconds" :min="5" :max="600" />
-            </el-form-item>
-            <el-form-item label="最大并发检测数">
-              <el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="3" />
-            </el-form-item>
-            <el-form-item label="日志脱敏">
-              <el-switch v-model="state.settings.redactLogs" />
-            </el-form-item>
-            <el-form-item label="Codex 默认 config.toml">
-              <el-input v-model="state.settings.defaultCodexConfig" type="textarea" :rows="14" class="code-input" />
-            </el-form-item>
-            <el-form-item label="Codex instruction.md">
-              <el-input v-model="state.settings.codexInstruction" type="textarea" :rows="5" class="code-input" />
-            </el-form-item>
-            <el-form-item label="Claude Code 默认 settings.json">
-              <el-input v-model="state.settings.defaultClaudeSettings" type="textarea" :rows="12" class="code-input" />
-            </el-form-item>
-            <el-form-item label="新管理员密码">
-              <el-input v-model="newAdminPassword" type="password" show-password placeholder="留空表示不修改" />
-            </el-form-item>
-            <el-form-item label="确认管理员密码">
-              <el-input v-model="confirmAdminPassword" type="password" show-password placeholder="再次输入新密码" />
-            </el-form-item>
+          <el-form label-position="top" class="settings-form">
+            <section class="settings-section">
+              <div class="settings-section-head"><strong>运行参数</strong><span>CLI 路径、数据存储和检测资源限制</span></div>
+              <div class="settings-grid">
+                <el-form-item label="Codex 命令"><el-input v-model="state.settings.codexCommand" /></el-form-item>
+                <el-form-item label="Claude Code 命令"><el-input v-model="state.settings.claudeCommand" /></el-form-item>
+                <el-form-item label="数据目录"><el-input v-model="state.settings.dataDir" /></el-form-item>
+                <el-form-item label="日志保留天数"><el-input-number v-model="state.settings.logRetentionDays" :min="1" :max="365" /></el-form-item>
+                <el-form-item label="默认检测超时（秒）"><el-input-number v-model="state.settings.defaultTimeoutSeconds" :min="5" :max="600" /></el-form-item>
+                <el-form-item label="最大并发检测数"><el-input-number v-model="state.settings.maxConcurrentChecks" :min="1" :max="3" /></el-form-item>
+                <el-form-item label="日志脱敏"><el-switch v-model="state.settings.redactLogs" active-text="启用" /></el-form-item>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-head"><strong>CLI 更新</strong><span>定期从 npm 官方源获取最新版本</span></div>
+              <div class="update-row">
+                <el-switch v-model="state.settings.autoUpdateEnabled" active-text="自动更新" />
+                <el-input-number v-model="state.settings.autoUpdateIntervalDays" :min="1" :max="365" />
+                <span class="field-suffix">天一次</span>
+                <el-button :loading="updateLoading.codex" @click="updateCli('codex')">更新 Codex</el-button>
+                <el-button :loading="updateLoading.claude" @click="updateCli('claude')">更新 Claude Code</el-button>
+              </div>
+              <div class="update-status-grid">
+                <span>Codex 最近更新：<b>{{ state.settings.codexLastUpdateAt ? formatTime(state.settings.codexLastUpdateAt) : '暂无记录' }}</b></span>
+                <span>Claude Code 最近更新：<b>{{ state.settings.claudeLastUpdateAt ? formatTime(state.settings.claudeLastUpdateAt) : '暂无记录' }}</b></span>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-head config-heading">
+                <div><strong>默认配置</strong><span>新建提供商时使用的初始 CLI 配置</span></div>
+                <div class="head-actions">
+                  <el-button @click="resetAllProviderConfig('codex')">应用 Codex 默认配置到全部</el-button>
+                  <el-button @click="resetAllProviderConfig('claude')">应用 Claude 默认配置到全部</el-button>
+                </div>
+              </div>
+              <el-form-item label="Codex 默认 config.toml"><el-input v-model="state.settings.defaultCodexConfig" type="textarea" :rows="14" class="code-input" /></el-form-item>
+              <el-form-item label="Codex instruction.md"><el-input v-model="state.settings.codexInstruction" type="textarea" :rows="5" class="code-input" /></el-form-item>
+              <el-form-item label="Claude Code 默认 settings.json"><el-input v-model="state.settings.defaultClaudeSettings" type="textarea" :rows="12" class="code-input" /></el-form-item>
+            </section>
+
+            <section class="settings-section">
+              <div class="settings-section-head"><strong>管理员安全</strong><span>留空表示保持当前密码</span></div>
+              <div class="settings-grid">
+                <el-form-item label="新管理员密码"><el-input v-model="newAdminPassword" type="password" show-password placeholder="输入新密码" /></el-form-item>
+                <el-form-item label="确认管理员密码"><el-input v-model="confirmAdminPassword" type="password" show-password placeholder="再次输入新密码" /></el-form-item>
+              </div>
+            </section>
           </el-form>
         </el-card>
       </section>
-    </main>
+      </main>
+    </div>
 
     <el-dialog v-model="backupImportDialog" width="520px" title="导入备份进度" :close-on-click-modal="backupImportJob?.done === true">
       <div v-if="backupImportJob" class="backup-import-panel">
