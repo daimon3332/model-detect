@@ -1069,21 +1069,20 @@ onMounted(boot)
                     {{ isModelChecking(provider.id, model.agent, model.name) ? '检测中' : latestModelRun(provider, model) ? stateLabel(latestModelRun(provider, model)!.state) : '未检测' }}
                   </el-tag>
                   <span class="last-run-time">{{ latestModelRun(provider, model) ? formatTime(latestModelRun(provider, model)!.createdAt) : '-' }}</span>
-                  <div class="result-cell">
-                    <span v-if="latestModelRun(provider, model)" class="result-summary">
-                      <el-tag size="small" effect="plain" :type="stateTagType(latestModelRun(provider, model))">{{ runText(latestModelRun(provider, model)) }}</el-tag>
-                      <span :title="latestModelRun(provider, model)?.errorMessage || ''">{{ latestModelRun(provider, model)?.errorMessage || stateLabel(latestModelRun(provider, model)!.state) }}</span>
-                    </span>
-                    <span v-else class="muted">暂无结果</span>
-                    <span v-if="recentRuns(state, provider.id, model.name, model.agent).length" class="recent-status-dots">
-                      <button
-                        v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
-                        :key="run.id"
-                        :class="run.state"
-                        :title="`${formatTime(run.createdAt)} / ${stateLabel(run.state)}`"
-                        @click="openRun(run)"
-                      ></button>
-                    </span>
+                  <div class="run-strip">
+                    <button
+                      v-for="run in recentRuns(state, provider.id, model.name, model.agent)"
+                      :key="run.id"
+                      class="run-chip"
+                      :class="run.state"
+                      :title="`${formatTime(run.createdAt)} / ${stateLabel(run.state)}`"
+                      :aria-label="`${stateLabel(run.state)}，${formatTime(run.createdAt)}`"
+                      @click="openRun(run)"
+                    >
+                      <b>{{ runText(run) }}</b>
+                      <small>{{ formatTime(run.createdAt) }}</small>
+                    </button>
+                    <span v-if="!recentRuns(state, provider.id, model.name, model.agent).length" class="muted">暂无检测记录</span>
                   </div>
                   <div class="row-actions">
                     <el-button

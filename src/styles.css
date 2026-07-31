@@ -226,20 +226,20 @@ button { font: inherit; }
 .provider-capabilities { justify-content: flex-end; color: #748095; font-size: 10px; }
 
 .monitor-table, .log-table { overflow-x: auto; }
-.table-head, .table-row { display: grid; min-width: 1080px; grid-template-columns: minmax(170px, 1.2fr) 110px 105px 135px minmax(260px, 1.8fr) 190px; align-items: center; gap: 12px; padding: 11px 15px; }
+.table-head, .table-row { display: grid; min-width: 1180px; grid-template-columns: minmax(170px, 1.2fr) 110px 105px 135px minmax(360px, 2.2fr) 190px; align-items: center; gap: 12px; padding: 11px 15px; }
 .table-head, .log-head { color: #697386; background: #f8f9fb; font-size: 11px; font-weight: 700; }
 .table-row, .log-row { border-top: 1px solid #edf0f4; }
 .table-row:hover, .log-row:hover { background: #fafcff; }
 .model-name { overflow: hidden; color: #273348; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .last-run-time { color: #657186; font-size: 11px; }
-.result-cell { display: grid; min-width: 0; gap: 6px; }
-.result-summary { display: flex; min-width: 0; align-items: center; gap: 7px; }
-.result-summary > span { overflow: hidden; color: #657186; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.recent-status-dots { display: flex; gap: 4px; }
-.recent-status-dots button { width: 7px; height: 7px; border: 0; border-radius: 50%; padding: 0; background: #cfd6e1; cursor: pointer; }
-.recent-status-dots button.success { background: #2eb67d; }
-.recent-status-dots button.warning, .recent-status-dots button.timeout { background: #e9a33d; }
-.recent-status-dots button.failed { background: #e05260; }
+.run-strip { display: flex; min-width: 0; flex-wrap: wrap; gap: 6px; }
+.run-chip { display: grid; min-width: 66px; border: 1px solid transparent; border-radius: 6px; padding: 6px 8px; cursor: pointer; line-height: 1.15; text-align: left; }
+.run-chip b { font-size: 12px; }
+.run-chip small { margin-top: 3px; color: inherit; opacity: 0.75; font-size: 9px; white-space: nowrap; }
+.run-chip.success { border-color: #b9e0d1; color: #126846; background: #edf8f3; }
+.run-chip.warning { border-color: #ecd09f; color: #92550e; background: #fff8e9; }
+.run-chip.failed { border-color: #efc1c7; color: #ad2f3e; background: #fff1f3; }
+.run-chip.timeout { border-color: #d1c8ed; color: #6244b3; background: #f4f1fb; }
 .model-section-head { align-items: flex-start; }
 .model-section-head .head-actions { flex: 1; justify-content: flex-end; }
 
